@@ -1,0 +1,94 @@
+name: CI & Binary Build
+
+on:
+  push:
+    branches: [ "main" ]
+    tags: [ "v*" ]
+  pull_request:
+    branches: [ "main" ]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  test:
+    name: Test (Python ${{ matrix.python-version }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.10", "3.11", "3.12", "3.13"]
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python ${{ matrix.python-version }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Run Unit Tests
+        run: python -m unittest discover -s tests -t .
+
+      - name: Run E2E Integration Suite
+        run: bash ./tests/test_runner.sh
+
+  build-binaries:
+    name: Build Standalone Binaries (Linux x86_64)
+    needs: test
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install PyInstaller
+        run: pip install --upgrade pyinstaller
+
+      - name: Build Standalone Binaries
+        run: |
+          mkdir -p dist
+          pyinstaller --onefile --clean --paths . bin/agent-root-runner -n agent-root-runner --distpath dist
+          pyinstaller --onefile --clean --paths . bin/agent-root-runner-daemon -n agent-root-runner-daemon --distpath dist
+          pyinstaller --onefile --clean --paths . bin/agent-root-exec -n agent-root-exec --distpath dist
+          pyinstaller --onefile --clean --paths . bin/agent-root-mcp -n agent-root-mcp --distpath dist
+
+      - name: Verify Binaries
+        run: |
+          ./dist/agent-root-runner --help
+          ./dist/agent-root-runner-daemon --help
+          ./dist/agent-root-exec --help
+          ./dist/agent-root-mcp --help
+
+      - name: Archive Binaries Tarball
+        run: |
+          tar -czf dist/agent-root-runner-linux-x86_64.tar.gz -C dist agent-root-runner agent-root-runner-daemon agent-root-exec agent-root-mcp
+
+      - name: Upload Artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: agent-root-runner-linux-x86_64
+          path: |
+            dist/agent-root-runner
+            dist/agent-root-runner-daemon
+            dist/agent-root-exec
+            dist/agent-root-mcp
+            dist/agent-root-runner-linux-x86_64.tar.gz
+
+      - name: Create Release
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            dist/agent-root-runner-linux-x86_64.tar.gz
+            dist/agent-root-runner
+            dist/agent-root-runner-daemon
+            dist/agent-root-exec
+            dist/agent-root-mcp
