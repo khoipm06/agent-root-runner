@@ -17,7 +17,10 @@ import sys
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
-from daemon.server import resolve_socket_path
+try:
+    from src.daemon.server import resolve_socket_path
+except ImportError:
+    from daemon.server import resolve_socket_path
 
 
 def send_exec(sock_path: str, command: str, timeout: int, workdir: str, env: dict) -> dict:

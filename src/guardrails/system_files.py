@@ -53,6 +53,13 @@ MUTATING_OPERATIONS: frozenset[str] = frozenset({
 })
 
 
+# Precomputed tuples of (p, os.path.basename(p), "/" + os.path.basename(p), p + "/") to avoid redundant os.path operations on hot path
+_PRECOMPUTED_AUTH_CHECKS: Tuple[Tuple[str, str, str, str], ...] = tuple(
+    (p, os.path.basename(p), "/" + os.path.basename(p), p + "/")
+    for p in PROTECTED_AUTH_PATHS
+)
+
+
 def matches_protected_auth(path_str: str) -> Optional[str]:
     """Checks if a path references a protected authentication asset."""
     norm = os.path.normpath(path_str)
@@ -70,13 +77,13 @@ def matches_protected_auth(path_str: str) -> Optional[str]:
     if norm == "sudoers.d" or norm.startswith("sudoers.d/") or norm.startswith("etc/sudoers.d"):
         return "/etc/sudoers.d"
 
-    for p in PROTECTED_AUTH_PATHS:
+    for p, base_p, slash_base_p, p_slash in _PRECOMPUTED_AUTH_CHECKS:
         if (
             norm == p
-            or norm.startswith(p + "/")
-            or norm.endswith("/" + os.path.basename(p))
+            or norm.startswith(p_slash)
+            or norm.endswith(slash_base_p)
             or p in norm
-            or norm == os.path.basename(p)
+            or norm == base_p
         ):
             return p
 

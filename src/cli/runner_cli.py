@@ -15,7 +15,10 @@ from pathlib import Path
 
 # Import daemon modules
 sys.path.insert(0, str(Path(__file__).parent.parent))
-from daemon.server import resolve_socket_path
+try:
+    from src.daemon.server import resolve_socket_path
+except ImportError:
+    from daemon.server import resolve_socket_path
 
 
 def connect_socket(sock_path: str) -> socket.socket:
