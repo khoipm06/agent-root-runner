@@ -29,8 +29,9 @@ from src.daemon.executor import (
 from src.daemon.state import RunnerStateMachine
 
 try:
-    from src.guardrails.analyzer import evaluate_command
+    from src.guardrails.analyzer import CommandAnalyzer, evaluate_command
 except ImportError:
+    CommandAnalyzer = None  # type: ignore
     evaluate_command = None  # type: ignore
 
 
@@ -68,6 +69,8 @@ class AgentRootRunnerDaemon:
         self.max_buffer_limit = max_buffer_limit
         if guardrail_evaluator is not None:
             self.guardrail_evaluator = guardrail_evaluator
+        elif CommandAnalyzer is not None:
+            self.guardrail_evaluator = CommandAnalyzer()
         else:
             self.guardrail_evaluator = evaluate_command
 

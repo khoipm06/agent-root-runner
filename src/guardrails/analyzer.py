@@ -48,6 +48,17 @@ class GuardrailVerdict:
         yield self.reason
 
 
+_DEFAULT_STORAGE_DAG: Optional[StorageDAG] = None
+
+
+def _get_default_storage_dag() -> StorageDAG:
+    # ponytail: process-lifetime cached DAG; refresh manually if mounts change dynamically.
+    global _DEFAULT_STORAGE_DAG
+    if _DEFAULT_STORAGE_DAG is None:
+        _DEFAULT_STORAGE_DAG = StorageDAG()
+    return _DEFAULT_STORAGE_DAG
+
+
 class CommandAnalyzer:
     """Reusable command analyzer maintaining a cached StorageDAG instance."""
 
@@ -86,7 +97,7 @@ def evaluate_command(
                 reason="Fork bomb pattern detected",
             )
 
-    dag = storage_dag or StorageDAG()
+    dag = storage_dag if storage_dag is not None else _get_default_storage_dag()
     parsed_commands = parse_command_chain(stripped)
 
     # Queue all atomic commands, peeled wrappers, and subshells for evaluation
