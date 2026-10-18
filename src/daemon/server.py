@@ -35,14 +35,25 @@ except ImportError:
     evaluate_command = None  # type: ignore
 
 
+SYSTEM_SOCKET_PATH = "/run/agent-root-runner/runner.sock"
+
+
 def resolve_socket_path(override_path: Optional[str] = None) -> str:
-    """Resolves standard socket path using priority hierarchy."""
+    """Resolves standard socket path using priority hierarchy.
+
+    Non-root clients are expected to talk to the root daemon's system socket,
+    which is group-owned (wheel) and mode 0660. The per-user runtime path is
+    only a fallback for user-mode/development daemons where no system socket
+    is present.
+    """
     if override_path:
         return os.path.abspath(override_path)
     if "AGENT_ROOT_RUNNER_SOCKET" in os.environ:
         return os.path.abspath(os.environ["AGENT_ROOT_RUNNER_SOCKET"])
     if os.geteuid() == 0:
-        return "/run/agent-root-runner/runner.sock"
+        return SYSTEM_SOCKET_PATH
+    if os.path.exists(SYSTEM_SOCKET_PATH):
+        return SYSTEM_SOCKET_PATH
     xdg_runtime = os.environ.get("XDG_RUNTIME_DIR")
     if xdg_runtime:
         return os.path.join(xdg_runtime, "agent-root-runner", "runner.sock")
