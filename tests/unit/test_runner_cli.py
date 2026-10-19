@@ -8,6 +8,8 @@ import tempfile
 import unittest
 from pathlib import Path
 from unittest import mock
+from contextlib import redirect_stderr, redirect_stdout
+from io import StringIO
 
 from src.cli import runner_cli
 
@@ -61,6 +63,37 @@ class TestSanitizedChildEnv(unittest.TestCase):
 
             self.assertEqual(rc, 0)
             self.assertEqual(out.read_text(), "<unset>")
+
+
+class TestArmCli(unittest.TestCase):
+    def test_forever_arm_sends_forever_and_quota_without_duration(self):
+        sock = mock.Mock()
+        output = StringIO()
+        response = {
+            "result": {
+                "is_armed": True,
+                "forever": True,
+                "expires_at": None,
+                "quota": 3,
+            }
+        }
+        with mock.patch.object(sys, "argv", ["agent-root-runner", "arm", "--forever", "--quota", "3"]):
+            with mock.patch.object(runner_cli, "resolve_socket_path", return_value="/run/test.sock"):
+                with mock.patch.object(runner_cli, "connect_socket", return_value=sock):
+                    with mock.patch.object(runner_cli, "send_request", return_value=response) as send:
+                        with redirect_stdout(output):
+                            runner_cli.main()
+
+        send.assert_called_once_with(sock, "arm", {"forever": True, "quota": 3})
+        sock.close.assert_called_once_with()
+        self.assertIn("Expires: Never", output.getvalue())
+
+    def test_forever_and_duration_are_mutually_exclusive(self):
+        with mock.patch.object(sys, "argv", ["agent-root-runner", "arm", "--forever", "--duration", "60"]):
+            with redirect_stderr(StringIO()):
+                with self.assertRaises(SystemExit) as raised:
+                    runner_cli.main()
+        self.assertEqual(raised.exception.code, 2)
 
 
 if __name__ == "__main__":

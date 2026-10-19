@@ -70,6 +70,7 @@ jobs:
       - name: Archive Binaries Tarball
         run: |
           tar -czf dist/agent-root-runner-linux-x86_64.tar.gz -C dist agent-root-runner agent-root-runner-daemon agent-root-exec agent-root-mcp
+          (cd plasma-applet && zip -qr ../dist/agent-root-runner-plasma-applet.zip metadata.json contents)
 
       - name: Upload Artifacts
         uses: actions/upload-artifact@v4
@@ -81,6 +82,7 @@ jobs:
             dist/agent-root-exec
             dist/agent-root-mcp
             dist/agent-root-runner-linux-x86_64.tar.gz
+            dist/agent-root-runner-plasma-applet.zip
 
       - name: Create Release
         if: startsWith(github.ref, 'refs/tags/v')
@@ -88,6 +90,7 @@ jobs:
         with:
           files: |
             dist/agent-root-runner-linux-x86_64.tar.gz
+            dist/agent-root-runner-plasma-applet.zip
             dist/agent-root-runner
             dist/agent-root-runner-daemon
             dist/agent-root-exec

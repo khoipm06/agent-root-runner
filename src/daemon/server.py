@@ -347,10 +347,24 @@ class AgentRootRunnerDaemon:
                 "duration_seconds", params.get("timeout_seconds", 900)
             )
             quota = params.get("quota")
+            forever = params.get("forever", False)
+            if forever is True and (
+                "duration_seconds" in params or "timeout_seconds" in params
+            ):
+                return {
+                    "jsonrpc": "2.0",
+                    "id": req_id,
+                    "error": {
+                        "code": -32602,
+                        "message": "Invalid params: 'forever' and a duration are mutually exclusive",
+                        "data": {"reason": "INVALID_PARAMS"},
+                    },
+                }
             try:
                 arm_res = await self.state_machine.arm(
                     duration_seconds=duration,
                     quota=quota,
+                    forever=forever,
                     requester_uid=creds.uid,
                     allow_user_arm=self.allow_user_arm,
                     requester_pid=creds.pid,
@@ -583,6 +597,11 @@ class AgentRootRunnerDaemon:
                     },
                 }
 
+            # Capture the active ARM deadline before quota accounting: consuming
+            # the final quota slot disarms the session, but that admitted
+            # command must still be bounded by the authorization window.
+            remaining = await self.state_machine.remaining_seconds()
+
             # Re-evaluate state & atomically consume quota under execution lock
             permitted, err = (
                 await self.state_machine.check_permission_and_decrement_quota()
@@ -612,8 +631,7 @@ class AgentRootRunnerDaemon:
 
             # 4. Subprocess Execution. Bound the command to the remaining arm
             # window so it cannot outlive its authorization.
-            remaining = await self.state_machine.remaining_seconds()
-            if remaining > 0:
+            if remaining is not None and remaining > 0:
                 timeout_seconds = min(timeout_seconds, remaining)
             try:
                 exec_res = await self.executor.execute(

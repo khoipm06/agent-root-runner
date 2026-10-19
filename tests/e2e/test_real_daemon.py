@@ -32,6 +32,7 @@ SOCKET_WAIT_SECONDS = 5.0
 STATUS_SESSION_FIELDS = (
     "state",
     "is_armed",
+    "forever",
     "session_id",
     "armed_at",
     "expires_at",
@@ -44,7 +45,7 @@ STATUS_SESSION_FIELDS = (
     "commands_executed",
     "lifetime_commands",
 )
-STATUS_FIELDS = STATUS_SESSION_FIELDS + ("socket_path", "daemon_pid")  # 15
+STATUS_FIELDS = STATUS_SESSION_FIELDS + ("socket_path", "daemon_pid")  # 16
 DISARM_FIELDS = (
     "state",
     "previous_state",
@@ -229,7 +230,7 @@ class TestRealDaemonE2E(RealDaemonTestBase):
     # 2 ---------------------------------------------------------------
     def test_status_disarmed_exact_fields(self) -> None:
         result = self.status()
-        self.assertEqual(len(result), 15, f"expected 15 fields, got {result}")
+        self.assertEqual(len(result), 16, f"expected 16 fields, got {result}")
         self.assertEqual(set(result), set(STATUS_FIELDS), f"field mismatch: {sorted(result)}")
         self.assertEqual(result["state"], "DISARMED")
         self.assertIs(result["is_armed"], False)
@@ -239,7 +240,7 @@ class TestRealDaemonE2E(RealDaemonTestBase):
     # 3 ---------------------------------------------------------------
     def test_arm_exact_fields(self) -> None:
         result = self.arm(duration=30, quota=3)
-        self.assertEqual(len(result), 13, f"expected 13 fields, got {result}")
+        self.assertEqual(len(result), 14, f"expected 14 fields, got {result}")
         self.assertEqual(set(result), set(STATUS_SESSION_FIELDS), f"field mismatch: {sorted(result)}")
         self.assertEqual(result["state"], "ARMED")
         self.assertIs(result["is_armed"], True)
@@ -251,6 +252,20 @@ class TestRealDaemonE2E(RealDaemonTestBase):
         self.assertEqual(result["timeout_seconds"], 30)
         self.assertEqual(result["quota_limit"], 3)
         self.assertEqual(result["quota_remaining"], 3)
+
+    def test_forever_arm_returns_disarmed_after_daemon_restart(self) -> None:
+        old_pid = self.proc.pid
+        arm_result = self.rpc("arm", {"forever": True, "quota": 3})
+        self.assertNotIn("error", arm_result, arm_result)
+        self.assertTrue(arm_result["result"]["forever"])
+
+        self.stop_daemon()
+        self.start_daemon()
+
+        status = self.status()
+        self.assertEqual(status["state"], "DISARMED")
+        self.assertFalse(status["forever"])
+        self.assertNotEqual(status["daemon_pid"], old_pid)
 
     # 4 ---------------------------------------------------------------
     def test_exec_disarmed_rejected(self) -> None:
@@ -279,6 +294,16 @@ class TestRealDaemonE2E(RealDaemonTestBase):
         self.assertIn("error", second)
         self.assertEqual(second["error"]["code"], -32001)
         self.assertEqual(second["error"]["data"]["reason"], "QUOTA_EXHAUSTED")
+
+    def test_last_quota_command_is_bounded_by_arm_deadline(self) -> None:
+        self.arm(duration=1, quota=1)
+        started = time.monotonic()
+
+        response = self.exec_rpc("sleep 5", timeout_seconds=5)
+
+        elapsed = time.monotonic() - started
+        self.assertEqual(response.get("error", {}).get("code"), -32004, response)
+        self.assertLess(elapsed, 3.0, f"final command outlived its ARM deadline ({elapsed:.2f}s)")
 
     # 7 ---------------------------------------------------------------
     def test_exec_timeout_returns_124(self) -> None:

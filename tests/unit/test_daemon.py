@@ -145,6 +145,39 @@ class TestStateMachine(unittest.IsolatedAsyncioTestCase):
         self.assertGreater(status["remaining_seconds"], 0.0)
         self.assertEqual(status["quota_remaining"], 5)
 
+    async def test_forever_arm_has_no_deadline_or_timer(self):
+        status = await self.sm.arm(forever=True, quota=2, allow_user_arm=True)
+
+        self.assertTrue(status["is_armed"])
+        self.assertTrue(status["forever"])
+        self.assertIsNone(status["duration_seconds"])
+        self.assertIsNone(status["expires_at"])
+        self.assertIsNone(status["remaining_seconds"])
+        self.assertIsNone(self.sm._timer_task)
+        self.assertIsNone(await self.sm.remaining_seconds())
+
+        await asyncio.sleep(0.02)
+        self.assertTrue(await self.sm.is_armed())
+
+        await self.sm.disarm()
+        self.assertFalse((await self.sm.get_status())["forever"])
+
+    async def test_forever_quota_exhaustion_and_guardrail_refund(self):
+        await self.sm.arm(forever=True, quota=1, allow_user_arm=True)
+
+        allowed, _ = await self.sm.check_permission_and_decrement_quota()
+        self.assertTrue(allowed)
+        self.assertEqual(self.sm.state, RunnerState.DISARMED)
+
+        await self.sm.refund_quota()
+        self.assertEqual(self.sm.state, RunnerState.ARMED)
+        self.assertIsNone(self.sm._timer_task)
+        self.assertIsNone(await self.sm.remaining_seconds())
+
+        allowed, _ = await self.sm.check_permission_and_decrement_quota()
+        self.assertTrue(allowed)
+        self.assertEqual(self.sm.state, RunnerState.DISARMED)
+
     async def test_arm_validation_errors(self):
         """Invalid duration or quota raises ValueError."""
         with self.assertRaises(ValueError):
@@ -155,6 +188,8 @@ class TestStateMachine(unittest.IsolatedAsyncioTestCase):
             await self.sm.arm(duration_seconds=90000, allow_user_arm=True)
         with self.assertRaises(ValueError):
             await self.sm.arm(duration_seconds=300, quota=0, allow_user_arm=True)
+        with self.assertRaises(ValueError):
+            await self.sm.arm(forever="yes", allow_user_arm=True)
 
     async def test_arm_permission_denied(self):
         """Arming by non-root without allow_user_arm raises PermissionError."""
@@ -488,6 +523,30 @@ class TestDaemonServerE2E(unittest.IsolatedAsyncioTestCase):
         # 4. Exec again -> Rejected
         exec_again = await self._send_request("exec", {"command": "echo 'locked_out'"})
         self.assertEqual(exec_again.get("error", {}).get("code"), -32001)
+
+    async def test_forever_arm_over_rpc_has_no_expiry(self):
+        arm_resp = await self._send_request("arm", {"forever": True, "quota": 3})
+        result = arm_resp.get("result", {})
+        self.assertEqual(result.get("state"), "ARMED")
+        self.assertTrue(result.get("forever"))
+        self.assertIsNone(result.get("expires_at"))
+        self.assertIsNone(result.get("remaining_seconds"))
+        self.assertEqual(result.get("quota_remaining"), 3)
+
+        status_resp = await self._send_request("status")
+        self.assertIsNone(status_resp["result"].get("remaining_seconds"))
+
+        await self._send_request("disarm")
+
+    async def test_forever_arm_rejects_non_boolean_rpc_value(self):
+        response = await self._send_request("arm", {"forever": "true"})
+        self.assertEqual(response.get("error", {}).get("code"), -32602)
+
+    async def test_forever_arm_rejects_rpc_duration_conflict(self):
+        response = await self._send_request(
+            "arm", {"forever": True, "duration_seconds": 300}
+        )
+        self.assertEqual(response.get("error", {}).get("code"), -32602)
 
     async def test_stale_socket_recovery(self):
         """Starting daemon over a stale dead socket file unlinks and recovers cleanly."""

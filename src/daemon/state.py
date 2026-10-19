@@ -42,8 +42,9 @@ class ArmSession:
     """Active arming session metadata."""
     session_id: str
     arm_timestamp: float
-    duration_seconds: int = 900
+    duration_seconds: Optional[int] = 900
     expires_at_monotonic: float = 0.0
+    forever: bool = False
     quota: Optional[int] = None
     quota_remaining: Optional[int] = None
     requester_uid: int = 0
@@ -95,6 +96,7 @@ class RunnerStateMachine:
         self,
         duration_seconds: int = DEFAULT_DURATION_SECONDS,
         quota: Optional[int] = None,
+        forever: bool = False,
         requester_uid: int = 0,
         allow_user_arm: bool = False,
         requester_pid: Optional[int] = None,
@@ -103,7 +105,7 @@ class RunnerStateMachine:
 
         Raises:
             PermissionError: If requester_uid is not authorized.
-            ValueError: If duration_seconds or quota are invalid.
+            ValueError: If duration_seconds, quota, or forever are invalid.
         """
         if not is_arm_authorized(requester_uid, allow_user_arm=allow_user_arm):
             raise PermissionError(
@@ -111,10 +113,15 @@ class RunnerStateMachine:
                 "Run 'sudo agent-root-runner arm' to enable."
             )
 
-        if not isinstance(duration_seconds, int) or duration_seconds < 1:
-            raise ValueError("duration_seconds must be a positive integer >= 1")
-        if duration_seconds > self.MAX_DURATION_SECONDS:
-            raise ValueError(f"duration_seconds exceeds maximum limit of {self.MAX_DURATION_SECONDS}s")
+        if not isinstance(forever, bool):
+            raise ValueError("forever must be a boolean")
+        if forever:
+            duration_seconds = None
+        else:
+            if not isinstance(duration_seconds, int) or duration_seconds < 1:
+                raise ValueError("duration_seconds must be a positive integer >= 1")
+            if duration_seconds > self.MAX_DURATION_SECONDS:
+                raise ValueError(f"duration_seconds exceeds maximum limit of {self.MAX_DURATION_SECONDS}s")
 
         if quota is not None:
             if not isinstance(quota, int) or quota < 1:
@@ -134,7 +141,8 @@ class RunnerStateMachine:
                 session_id=session_id,
                 arm_timestamp=now_epoch,
                 duration_seconds=duration_seconds,
-                expires_at_monotonic=now_mono + duration_seconds,
+                expires_at_monotonic=(now_mono + duration_seconds) if duration_seconds is not None else 0.0,
+                forever=forever,
                 quota=quota,
                 quota_remaining=quota,
                 requester_uid=requester_uid,
@@ -145,20 +153,23 @@ class RunnerStateMachine:
             self._in_flight_commands = 0
             self._last_disarm_reason = None
 
-            # Spawn Active Countdown Task (Tier 1)
-            self._timer_task = asyncio.create_task(
-                self._auto_lock_countdown(session_id, duration_seconds)
-            )
+            # Finite sessions get an active countdown; forever sessions rely
+            # on explicit disarm, quota exhaustion, or daemon restart.
+            if duration_seconds is not None:
+                self._timer_task = asyncio.create_task(
+                    self._auto_lock_countdown(session_id, duration_seconds)
+                )
 
             # Emit audit log event
             await self._emit_audit("ARM", {
                 "session_id": session_id,
+                "forever": forever,
                 "duration_seconds": duration_seconds,
                 "timeout_seconds": duration_seconds,
                 "quota": quota,
                 "uid": requester_uid,
                 "pid": requester_pid,
-                "expires_at": self._format_iso(now_epoch + duration_seconds),
+                "expires_at": self._format_iso(now_epoch + duration_seconds) if duration_seconds is not None else None,
             })
 
             return self._build_status_dict_locked()
@@ -199,12 +210,14 @@ class RunnerStateMachine:
             await self._check_passive_expiry_locked()
             return self._state == RunnerState.ARMED
 
-    async def remaining_seconds(self) -> float:
-        """Seconds left in the current ARMED session (0.0 if disarmed)."""
+    async def remaining_seconds(self) -> Optional[float]:
+        """Seconds left (None for forever sessions, zero when disarmed)."""
         async with self._lock:
             await self._check_passive_expiry_locked()
             if self._state != RunnerState.ARMED or self._session is None:
                 return 0.0
+            if self._session.forever:
+                return None
             return max(0.0, self._session.expires_at_monotonic - time.monotonic())
 
     async def check_permission_and_decrement_quota(self) -> Tuple[bool, str]:
@@ -272,23 +285,36 @@ class RunnerStateMachine:
                         self._last_disarm_reason = None
 
                         # 3. Restart Active Countdown Task for remaining duration
-                        remaining_seconds = max(
-                            0.0, self._session.expires_at_monotonic - time.monotonic()
+                        remaining_seconds = (
+                            None
+                            if self._session.forever
+                            else max(
+                                0.0,
+                                self._session.expires_at_monotonic - time.monotonic(),
+                            )
                         )
                         if self._timer_task is not None and not self._timer_task.done():
                             self._timer_task.cancel()
-                        self._timer_task = asyncio.create_task(
-                            self._auto_lock_countdown(
-                                self._session.session_id, remaining_seconds
+                        if remaining_seconds is None:
+                            self._timer_task = None
+                        else:
+                            self._timer_task = asyncio.create_task(
+                                self._auto_lock_countdown(
+                                    self._session.session_id, remaining_seconds
+                                )
                             )
-                        )
 
                         # 4. Emit audit log event for re-arming via quota refund
                         await self._emit_audit("ARM", {
                             "session_id": self._session.session_id,
+                            "forever": self._session.forever,
                             "reason": "QUOTA_REFUND",
                             "quota_remaining": self._session.quota_remaining,
-                            "remaining_seconds": round(remaining_seconds, 1),
+                            "remaining_seconds": (
+                                round(remaining_seconds, 1)
+                                if remaining_seconds is not None
+                                else None
+                            ),
                         })
 
     async def record_command_execution(
@@ -411,14 +437,22 @@ class RunnerStateMachine:
             quota = self._session.quota
             quota_remaining = self._session.quota_remaining
             armed_at_iso = self._format_iso(self._session.arm_timestamp)
-            expires_at_iso = self._format_iso(self._session.arm_timestamp + self._session.duration_seconds)
+            if duration is not None:
+                expires_at_iso = self._format_iso(self._session.arm_timestamp + duration)
 
-            if self._state == RunnerState.ARMED:
+            if self._state == RunnerState.ARMED and not self._session.forever:
                 remaining = max(0.0, round(self._session.expires_at_monotonic - now_mono, 1))
+            elif self._state == RunnerState.ARMED:
+                remaining = None
 
         return {
             "state": self._state.value,
             "is_armed": self._state == RunnerState.ARMED,
+            "forever": bool(
+                self._state == RunnerState.ARMED
+                and self._session
+                and self._session.forever
+            ),
             "session_id": session_id,
             "armed_at": armed_at_iso,
             "expires_at": expires_at_iso,

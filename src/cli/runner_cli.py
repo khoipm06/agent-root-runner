@@ -90,6 +90,7 @@ def cmd_status(args):
         ("Remaining", "remaining_seconds"),
         ("Timeout", "timeout_seconds"),
         ("Duration", "duration_seconds"),
+        ("Forever", "forever"),
         ("Quota limit", "quota_limit"),
         ("Quota remaining", "quota_remaining"),
         ("Commands executed", "commands_executed"),
@@ -101,14 +102,18 @@ def cmd_status(args):
             print(f"{label}: {result[key]}")
     if result.get("state") == "DISARMED":
         print("Daemon is disarmed. Run 'agent-root-runner arm' to enable.")
+    elif result.get("forever"):
+        print("ARM has no time limit; disarm manually, exhaust quota, or restart the daemon.")
 
 
 def cmd_arm(args):
     sock_path = resolve_socket_path(args.socket)
     sock = connect_socket(sock_path)
     try:
-        params = {"duration_seconds": args.duration}
-        if args.quota:
+        params = {"forever": args.forever}
+        if not args.forever:
+            params["duration_seconds"] = args.duration if args.duration is not None else 900
+        if args.quota is not None:
             params["quota"] = args.quota
         resp = send_request(sock, "arm", params)
     finally:
@@ -119,6 +124,8 @@ def cmd_arm(args):
     print(f"Armed: {result.get('is_armed', False)}")
     if result.get("expires_at"):
         print(f"Expires at: {result['expires_at']}")
+    elif result.get("forever"):
+        print("Expires: Never (manual disarm, quota exhaustion, or daemon restart)")
     if result.get("quota"):
         print(f"Quota: {result['quota']} commands")
 
@@ -457,7 +464,9 @@ def main():
     subparsers.add_parser("disarm", help="Disarm the daemon (block exec)")
 
     arm_p = subparsers.add_parser("arm", help="Arm the daemon (allow exec)")
-    arm_p.add_argument("--duration", type=int, default=900, help="Arming duration in seconds (default: 900)")
+    arm_mode = arm_p.add_mutually_exclusive_group()
+    arm_mode.add_argument("--duration", type=int, default=None, help="Arming duration in seconds (default: 900; max: 86400)")
+    arm_mode.add_argument("--forever", action="store_true", help="Arm without a time limit; manual disarm, quota exhaustion, or daemon restart ends the session")
     arm_p.add_argument("--quota", type=int, default=None, help="Max commands before auto-disarm")
 
     subparsers.add_parser("install", help="Install systemd service unit")

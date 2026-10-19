@@ -134,6 +134,13 @@ sudo agent-root-runner uninstall
    sudo agent-root-runner arm --duration 600 --quota 25
    ```
 
+   ARM without a time limit only when you explicitly intend to leave privileged
+   execution available. It remains active until manual disarm, quota exhaustion,
+   or daemon restart; it is never restored after a restart:
+   ```bash
+   sudo agent-root-runner arm --forever --quota 25
+   ```
+
 2. **Agent Execution**: The agent calls `agent-root-exec` or the MCP tool `run_privileged_command`:
    ```bash
    agent-root-exec -- <command...>
@@ -143,6 +150,83 @@ sudo agent-root-runner uninstall
    ```bash
    sudo agent-root-runner disarm
    ```
+
+   `--forever` has no time-based lock. Always use `disarm` when privileged work
+   is complete. The daemon service itself is managed by systemd and normally
+   stays running while its authorization state remains DISARMED.
+
+### Plasma 6 System Tray Applet
+
+The repository includes a Plasma 6 applet for monitoring and controlling the
+daemon. It refreshes status every three seconds, offers bounded ARM and Disarm,
+and requires a second confirmation before requesting an ARM without a time
+limit. ARM actions invoke `pkexec` and still require system authorization.
+
+```bash
+kpackagetool6 --type Plasma/Applet --install ./plasma-applet
+```
+
+Then add **Agent Root Runner** to a panel from Plasma's **Add Widgets** dialog.
+Remove it with:
+
+```bash
+kpackagetool6 --type Plasma/Applet --remove org.khoipm.agent-root-runner
+```
+
+The applet requires Agent Root Runner installed at `/usr/local/bin` and an
+active `agent-root-runner.service`. The desktop user must be in the `wheel`
+group to read status and send disarm requests through the protected socket (see
+the install requirements above). To use the applet from a release archive,
+download `agent-root-runner-plasma-applet.zip` and pass that archive to
+`kpackagetool6 --type Plasma/Applet --install`.
+
+### Command-Line Options
+
+Management CLI:
+
+| Command | Options | Behavior |
+|---|---|---|
+| `agent-root-runner [--socket PATH] status` | `--socket` overrides the daemon socket path | Show daemon/session state and quota. |
+| `agent-root-runner [--socket PATH] disarm` | `--socket` overrides the daemon socket path | Immediately disable privileged execution. |
+| `agent-root-runner [--socket PATH] arm` | `--duration SECONDS` (default `900`, range `1..86400`) | ARM for a bounded duration. |
+| `agent-root-runner [--socket PATH] arm` | `--quota COUNT` (optional, positive integer) | Automatically disarm after this many admitted commands. Can be combined with either ARM mode. |
+| `agent-root-runner [--socket PATH] arm` | `--forever` | ARM without a time deadline; mutually exclusive with `--duration`. Manual disarm, quota exhaustion, or daemon restart ends the session. |
+| `agent-root-runner install` | — | Install/enable/start the systemd daemon service. Requires administrator authorization. |
+| `agent-root-runner uninstall` | — | Remove the systemd service installation. Requires administrator authorization. |
+
+On a desktop with Polkit, prefix administrative CLI operations with
+`pkexec` (for example, `pkexec agent-root-runner arm --duration 300`). On other
+systems use the configured administrator mechanism, such as `sudo`.
+
+Privileged execution wrapper:
+
+| Option | Default | Behavior |
+|---|---|---|
+| `--timeout SECONDS` | `60` | Maximum execution time (`1..3600` seconds); execution also cannot outlive the ARM window. |
+| `--workdir PATH` | `/` | Working directory for the command. |
+| `--socket PATH` | Automatically resolved | Override the daemon socket. |
+| `--env KEY=VALUE` | None | Add an environment variable; repeat to pass several. |
+| `command [command ...]` | Required | Command text joined with spaces and executed by the daemon. |
+
+For example, after ARM:
+
+```bash
+agent-root-exec --timeout 30 --workdir / --env LANG=C -- id -u
+```
+
+Daemon-only options (normally supplied by systemd):
+
+| Option | Default | Behavior |
+|---|---|---|
+| `--socket PATH` | `/run/agent-root-runner/runner.sock` | Unix socket path. |
+| `--audit-log PATH` | `/var/log/agent-root-runner/audit.log` | Append-only audit log path. |
+| `--allow-user-arm` | Disabled | Development/test mode only; rejected when the daemon runs as root. |
+
+Run each installed command with `--help` for its parser's help text. The MCP
+server `agent-root-mcp [--socket PATH]` exposes `run_privileged_command` with
+`command` (required), `workdir` (default `/`), `timeout` (default `60`, range
+`1..3600`), and `env` (default `{}`, string values). MCP tools execute commands but cannot ARM the daemon;
+the operator must ARM first.
 
 ---
 
@@ -159,7 +243,7 @@ The `agent-root-mcp` entry point is already on `PATH` after
 |---|---|---|
 | **Antigravity (`agy`)** | `agy mcp add agent-root-runner /usr/local/bin/agent-root-mcp` | Adds to global Antigravity MCP settings |
 | **OpenCode (`opencode`)** | `opencode mcp add --global agent-root-runner -- /usr/local/bin/agent-root-mcp` | `--global` configures across all projects |
-| **Pi Coding Agent (`pi`)** | `pi mcp add agent-root-runner -- /usr/local/bin/agent-root-mcp` | Adds to `~/.pi/agent/mcp.json` |
+| **Pi Coding Agent (`pi`)** | `pi mcp add agent-root-runner --exposure direct -- /usr/local/bin/agent-root-mcp` | Adds to `~/.pi/agent/mcp.json` and exposes the tool directly to the model |
 
 ### MCP Tool Schema
 
