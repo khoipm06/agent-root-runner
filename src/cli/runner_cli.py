@@ -163,11 +163,41 @@ def _resolve_unit_source() -> Path:
     return candidates[0]
 
 
+def _sanitized_child_env() -> dict:
+    """Environment for host tools (systemctl, …) spawned by the CLI.
+
+    A PyInstaller one-file build prepends its extraction directory
+    (``sys._MEIPASS``) to ``LD_LIBRARY_PATH``. Child processes inherit that and
+    would then load the *bundled* shared libraries (for example an older
+    ``libcrypto.so.3``) instead of the host's, which breaks dynamically linked
+    system tools such as ``systemctl``. Strip the bundle directory (and
+    ``LD_PRELOAD``) from the environment handed to our children.
+    """
+    env = dict(os.environ)
+    meipass = getattr(sys, "_MEIPASS", None)
+    if not meipass:
+        return env
+
+    bundle = os.path.realpath(meipass)
+    lib_path = env.get("LD_LIBRARY_PATH", "")
+    kept = [
+        entry
+        for entry in lib_path.split(":")
+        if entry and os.path.realpath(entry) != bundle
+    ]
+    if kept:
+        env["LD_LIBRARY_PATH"] = ":".join(kept)
+    else:
+        env.pop("LD_LIBRARY_PATH", None)
+    env.pop("LD_PRELOAD", None)
+    return env
+
+
 def _run_systemctl(*args: str) -> int:
     """Run systemctl, streaming output; return exit code."""
     import subprocess
 
-    return subprocess.call(["systemctl", *args])
+    return subprocess.call(["systemctl", *args], env=_sanitized_child_env())
 
 
 def _force_unlink(path: Path) -> None:

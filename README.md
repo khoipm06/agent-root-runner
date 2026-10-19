@@ -242,7 +242,7 @@ The repository includes a comprehensive 4-tier automated test suite requiring no
 # Run all 4 E2E tiers (59 tests)
 ./tests/test_runner.sh
 
-# Run full unit and adversarial test suites (266 tests)
+# Run full unit and adversarial test suites (270 tests)
 python3 -m unittest discover -s tests -t .
 ```
 
