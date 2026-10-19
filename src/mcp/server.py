@@ -18,6 +18,11 @@ try:
 except ImportError:
     from daemon.server import resolve_socket_path
 
+try:
+    from src import __version__
+except ImportError:  # pragma: no cover - safety net for unusual layouts
+    __version__ = "1.0.1"
+
 
 class MCPServer:
     """Minimal stdio JSON-RPC 2.0 MCP server."""
@@ -87,7 +92,7 @@ class MCPServer:
         self._send_result(req_id, {
             "protocolVersion": version,
             "capabilities": {"tools": {}},
-            "serverInfo": {"name": "agent-root-mcp", "version": "1.0.0"},
+            "serverInfo": {"name": "agent-root-mcp", "version": __version__},
         })
 
     def handle_tools_list(self, req_id, params: dict):

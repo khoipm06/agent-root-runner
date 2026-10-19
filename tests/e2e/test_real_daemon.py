@@ -219,7 +219,9 @@ class TestRealDaemonE2E(RealDaemonTestBase):
             f"ping missing fields: {result}",
         )
         self.assertEqual(result["status"], "ok")
-        self.assertEqual(result["version"], "1.0.0")
+        from src import __version__
+
+        self.assertEqual(result["version"], __version__)
         self.assertIsInstance(result["daemon_pid"], int)
         self.assertIn("uptime_sec", result)
         self.assertIsInstance(result["uptime_sec"], (int, float))

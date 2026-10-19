@@ -22,7 +22,7 @@ import unittest
 from typing import Optional
 
 from tests.fixtures.client import SocketRpcClient
-from tests.fixtures.test_daemon import start_daemon_process, stop_daemon_process
+from tests.fixtures.daemon_process import start_daemon_process, stop_daemon_process
 
 
 class TestTier2Boundaries(unittest.TestCase):
@@ -63,13 +63,17 @@ class TestTier2Boundaries(unittest.TestCase):
         self.client.close()
 
     def test_b01_empty_command_handling(self):
-        """B-01: Executing empty string command is handled gracefully without crashing."""
+        """B-01: Executing empty string command is handled gracefully without crashing.
+
+        The daemon refuses to spawn a shell for an empty command and reports a
+        distinct exit status (2) with an explanatory stderr instead of crashing
+        or silently succeeding.
+        """
         self.client.arm(duration_seconds=60)
         resp = self.client.exec_cmd("")
-        # Empty command should either succeed as no-op (exit 0) or return valid result
-        self.assertTrue("result" in resp or "error" in resp)
-        if "result" in resp:
-            self.assertEqual(resp["result"]["exit_code"], 0)
+        self.assertIn("result", resp)
+        self.assertEqual(resp["result"]["exit_code"], 2)
+        self.assertIn("Empty command", resp["result"]["stderr"])
 
     def test_b02_whitespace_only_command(self):
         """B-02: Executing whitespace-only command produces clean exit code 0 or handled result."""

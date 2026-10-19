@@ -236,13 +236,13 @@ sudo grep "GUARDRAIL_BLOCKED" /var/log/agent-root-runner/audit.log
 
 ## Automated Testing
 
-The repository includes a comprehensive 4-tier automated test suite requiring no sudo password prompts:
+The repository includes a comprehensive 4-tier automated test suite requiring no sudo password prompts. The E2E tiers spawn the **real** `src.daemon.server` process (unprivileged, with `--allow-user-arm`), so they exercise the production state machine, guardrail analyzer, executor, and audit logger end-to-end.
 
 ```bash
-# Run all 4 test tiers (59 tests)
+# Run all 4 E2E tiers (59 tests)
 ./tests/test_runner.sh
 
-# Run full unit and adversarial test suites (260 tests)
+# Run full unit and adversarial test suites (266 tests)
 python3 -m unittest discover -s tests -t .
 ```
 

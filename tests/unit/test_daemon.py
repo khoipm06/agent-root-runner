@@ -447,11 +447,13 @@ class TestDaemonServerE2E(unittest.IsolatedAsyncioTestCase):
         return json.loads(line.decode("utf-8"))
 
     async def test_ping(self):
-        """Ping returns ok and version 1.0.0."""
+        """Ping returns ok and the current package version."""
+        from src import __version__
+
         resp = await self._send_request("ping")
         self.assertEqual(resp.get("jsonrpc"), "2.0")
         self.assertEqual(resp.get("result", {}).get("status"), "ok")
-        self.assertEqual(resp.get("result", {}).get("version"), "1.0.0")
+        self.assertEqual(resp.get("result", {}).get("version"), __version__)
 
     async def test_status_disarmed_by_default(self):
         """Status initially reflects DISARMED."""

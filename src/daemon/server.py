@@ -20,6 +20,7 @@ import sys
 import time
 from typing import Any, Dict, Optional, Set, Tuple
 
+from src import __version__
 from src.daemon.audit import AuditLogger
 from src.daemon.auth import PeerCredentials, get_peer_credentials
 from src.daemon.executor import (
@@ -329,7 +330,7 @@ class AgentRootRunnerDaemon:
                 "id": req_id,
                 "result": {
                     "status": "ok",
-                    "version": "1.0.0",
+                    "version": __version__,
                     "uptime_sec": round(time.monotonic() - self.start_time, 2),
                     "daemon_pid": os.getpid(),
                 },

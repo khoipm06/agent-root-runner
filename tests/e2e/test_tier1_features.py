@@ -22,7 +22,7 @@ from typing import Optional
 
 from tests.fixtures.client import SocketRpcClient
 from tests.fixtures.mock_tools import read_audit_log
-from tests.fixtures.test_daemon import start_daemon_process, stop_daemon_process
+from tests.fixtures.daemon_process import start_daemon_process, stop_daemon_process
 
 
 class BaseTier1TestCase(unittest.TestCase):

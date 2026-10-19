@@ -18,7 +18,7 @@ from typing import Optional
 
 from tests.fixtures.client import SocketRpcClient
 from tests.fixtures.mock_tools import create_mock_binaries, read_audit_log
-from tests.fixtures.test_daemon import start_daemon_process, stop_daemon_process
+from tests.fixtures.daemon_process import start_daemon_process, stop_daemon_process
 
 
 class TestTier4Scenarios(unittest.TestCase):
@@ -38,7 +38,7 @@ class TestTier4Scenarios(unittest.TestCase):
         cls.audit_path = os.path.join(cls.tmpdir, "audit.log")
 
         # Create mock binaries for diagnostic commands
-        create_mock_binaries(cls.bin_dir)
+        cls.bins = create_mock_binaries(cls.bin_dir)
 
         cls.daemon_proc = start_daemon_process(
             socket_path=cls.sock_path,
@@ -55,8 +55,9 @@ class TestTier4Scenarios(unittest.TestCase):
         self.client = SocketRpcClient(socket_path=self.sock_path)
         self.client.connect()
         self.client.disarm()
-        # Add mock bin dir to child environment
-        self.env = {"PATH": f"{self.bin_dir}:{os.environ.get('PATH', '')}"}
+        # The daemon refuses caller-supplied PATH (fail-closed environment), so the
+        # mock diagnostic tools are invoked by absolute path instead.
+        self.bins = type(self).bins
 
     def tearDown(self):
         try:
@@ -68,7 +69,7 @@ class TestTier4Scenarios(unittest.TestCase):
     def test_s01_smartctl_storage_inspection_allowed(self):
         """S-01: Agent executes smartctl health query on NVMe drive without guardrail interference."""
         self.client.arm(duration_seconds=300)
-        resp = self.client.exec_cmd("smartctl -a /dev/nvme0n1", env=self.env)
+        resp = self.client.exec_cmd(f"{self.bins['smartctl']} -a /dev/nvme0n1")
         self.assertIn("result", resp)
         self.assertEqual(resp["result"]["exit_code"], 0)
         self.assertIn("PASSED", resp["result"]["stdout"])
@@ -85,7 +86,7 @@ class TestTier4Scenarios(unittest.TestCase):
     def test_s03_firewall_rule_inspection_allowed(self):
         """S-03: Agent queries firewall state with iptables -L without modification."""
         self.client.arm(duration_seconds=300)
-        resp = self.client.exec_cmd("iptables -L -n", env=self.env)
+        resp = self.client.exec_cmd(f"{self.bins['iptables']} -L -n")
         self.assertIn("result", resp)
         self.assertEqual(resp["result"]["exit_code"], 0)
         self.assertIn("Chain INPUT", resp["result"]["stdout"])
@@ -93,14 +94,14 @@ class TestTier4Scenarios(unittest.TestCase):
     def test_s04_firewall_rule_flush_blocked(self):
         """S-04: Agent attempting indiscriminate firewall flush (iptables -F) is blocked."""
         self.client.arm(duration_seconds=300)
-        resp = self.client.exec_cmd("iptables -F", env=self.env)
+        resp = self.client.exec_cmd(f"{self.bins['iptables']} -F")
         self.assertIn("error", resp)
         self.assertEqual(resp["error"]["code"], -32002)
 
     def test_s05_hdparm_identity_probe_allowed(self):
         """S-05: Agent inspects drive geometry via hdparm -I read-only mode."""
         self.client.arm(duration_seconds=300)
-        resp = self.client.exec_cmd("hdparm -I /dev/nvme0n1", env=self.env)
+        resp = self.client.exec_cmd(f"{self.bins['hdparm']} -I /dev/nvme0n1")
         self.assertIn("result", resp)
         self.assertEqual(resp["result"]["exit_code"], 0)
         self.assertIn("Model Number", resp["result"]["stdout"])
@@ -108,7 +109,7 @@ class TestTier4Scenarios(unittest.TestCase):
     def test_s06_systemctl_service_query_allowed(self):
         """S-06: Agent checks service status with systemctl status."""
         self.client.arm(duration_seconds=300)
-        resp = self.client.exec_cmd("systemctl status NetworkManager", env=self.env)
+        resp = self.client.exec_cmd(f"{self.bins['systemctl']} status NetworkManager")
         self.assertIn("result", resp)
         self.assertEqual(resp["result"]["exit_code"], 0)
         self.assertIn("active (running)", resp["result"]["stdout"])
@@ -116,7 +117,7 @@ class TestTier4Scenarios(unittest.TestCase):
     def test_s07_systemctl_network_service_kill_blocked(self):
         """S-07: Agent attempting to stop critical network service is blocked."""
         self.client.arm(duration_seconds=300)
-        resp = self.client.exec_cmd("systemctl stop NetworkManager", env=self.env)
+        resp = self.client.exec_cmd(f"{self.bins['systemctl']} stop NetworkManager")
         self.assertIn("error", resp)
         self.assertEqual(resp["error"]["code"], -32002)
 
@@ -134,7 +135,7 @@ class TestTier4Scenarios(unittest.TestCase):
         self.assertEqual(st1["result"]["state"], "DISARMED")
 
         # Step 2: Unprivileged command fails
-        rej = self.client.exec_cmd("smartctl -a /dev/nvme0n1", env=self.env)
+        rej = self.client.exec_cmd(f"{self.bins['smartctl']} -a /dev/nvme0n1")
         self.assertEqual(rej["error"]["code"], -32001)
 
         # Step 3: Operator arms
@@ -143,7 +144,7 @@ class TestTier4Scenarios(unittest.TestCase):
         session_id = arm_res["result"]["session_id"]
 
         # Step 4: Diagnostic succeeds
-        diag = self.client.exec_cmd("smartctl -a /dev/nvme0n1", env=self.env)
+        diag = self.client.exec_cmd(f"{self.bins['smartctl']} -a /dev/nvme0n1")
         self.assertEqual(diag["result"]["exit_code"], 0)
 
         # Step 5: Dangerous command blocked

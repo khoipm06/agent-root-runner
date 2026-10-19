@@ -334,6 +334,74 @@ class TestEmpiricalDiscoveredBypasses(unittest.TestCase):
             self.assertTrue(v.allowed, f"Expected bypass on herestring shell feed: {b}")
 
 
+class TestRemediatedWrapperAndFlagBypasses(unittest.TestCase):
+    """Regression suite for wrapper / flag bypasses closed in this iteration.
+
+    Each payload below previously slipped past the parser; it must now be
+    blocked, while the equivalent benign form stays allowed.
+    """
+
+    def setUp(self):
+        self.analyzer = CommandAnalyzer()
+
+    def _assert_blocked(self, cmd: str) -> None:
+        v = self.analyzer.evaluate(cmd)
+        self.assertFalse(v.allowed, f"Expected block, but allowed: {cmd}")
+        self.assertIsNotNone(v.matched_rule)
+
+    def test_shell_keyword_wrappers_closed(self):
+        for cmd in (
+            "command rm -rf /",
+            "builtin rm -rf /",
+            "nocorrect rm -rf /",
+            "! rm -rf /",
+            "sudo command rm -rf /",
+            "command sh -c 'rm -rf /'",
+        ):
+            with self.subTest(cmd=cmd):
+                self._assert_blocked(cmd)
+
+    def test_combined_inplace_flag_clusters_closed(self):
+        for cmd in (
+            "sed -ni s/a/b/ /etc/fstab",
+            "sed -i -n s/a/b/ /etc/fstab",
+            "perl -pi -e s/a/b/ /etc/fstab",
+            "perl -ni -e 'print' /etc/fstab",
+        ):
+            with self.subTest(cmd=cmd):
+                self._assert_blocked(cmd)
+
+    def test_read_only_sed_still_allowed(self):
+        for cmd in ("sed -n 's/a/b/p' /etc/fstab", "sed -e 's/a/b/' /etc/fstab"):
+            with self.subTest(cmd=cmd):
+                self.assertTrue(self.analyzer.evaluate(cmd).allowed, cmd)
+
+    def test_copy_out_of_auth_file_allowed(self):
+        # Copying *out of* /etc does not mutate it.
+        for cmd in ("cp /etc/passwd /tmp/backup", "cp /etc/shadow /tmp/shadow.bak"):
+            with self.subTest(cmd=cmd):
+                self.assertTrue(self.analyzer.evaluate(cmd).allowed, cmd)
+
+    def test_copy_into_auth_file_blocked(self):
+        for cmd in (
+            "cp /tmp/passwd /etc/passwd",
+            "cp /tmp/shadow /etc/shadow",
+            "install /tmp/sudoers /etc/sudoers",
+        ):
+            with self.subTest(cmd=cmd):
+                self._assert_blocked(cmd)
+
+    def test_home_workspace_deletion_allowed_but_home_root_blocked(self):
+        # Personal/workspace data is intentionally not protected (see README).
+        self.assertTrue(
+            self.analyzer.evaluate("rm -rf /home/user/project/build").allowed
+        )
+        # Recursively deleting the /home mount itself, or other system mounts,
+        # is still blocked.
+        self._assert_blocked("rm -rf /home")
+        self._assert_blocked("rm -rf /etc")
+
+
 class TestEmpiricalDiscoveredFalsePositives(unittest.TestCase):
     """Verification that previously discovered false positives in StorageDAG are remediated."""
 

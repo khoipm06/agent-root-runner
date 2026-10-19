@@ -6,7 +6,7 @@ Covers pairwise interactions and multi-component workflows:
 3. Guardrail Rejection followed immediately by Valid Command (pipeline resilience)
 4. Quota Accounting with Guardrail Violations
 5. Non-Blocking Status Queries during Subprocess Execution (concurrency)
-6. Environment Sanitization + Forbidden Variable Stripping (LD_PRELOAD, BASH_ENV)
+6. Pristine Environment + Forbidden Variable Rejection (LD_PRELOAD, BASH_ENV)
 7. Multi-Connection Session Persistence (separate socket connections share armed state)
 8. MCP Tool Call + Daemon Auto-Lock Transition
 """
@@ -24,7 +24,7 @@ from typing import Optional
 
 from tests.fixtures.client import SocketRpcClient
 from tests.fixtures.mock_tools import read_audit_log
-from tests.fixtures.test_daemon import start_daemon_process, stop_daemon_process
+from tests.fixtures.daemon_process import start_daemon_process, stop_daemon_process
 
 
 class TestTier3Combinations(unittest.TestCase):
@@ -113,21 +113,25 @@ class TestTier3Combinations(unittest.TestCase):
         self.assertIn("result", r2)
         self.assertEqual(r2["result"]["exit_code"], 0)
 
-    def test_c04_environment_sanitization_strips_injections(self):
-        """C-04: Daemon scrubs dangerous environment variables (LD_PRELOAD) from subprocess."""
+    def test_c04_environment_injection_rejected(self):
+        """C-04: Prohibited environment variables (LD_PRELOAD, BASH_ENV) are rejected
+        outright (fail-closed) rather than silently stripped or passed through.
+
+        The daemon runs with a pristine baseline environment; a caller may extend it
+        with safe variables, but never override PATH/SHELL/LD_*/BASH_ENV/etc.
+        """
         self.client.arm(duration_seconds=300)
-        test_env = {
-            "LD_PRELOAD": "/tmp/evil.so",
-            "BASH_ENV": "/tmp/evil.sh",
-            "CUSTOM_SAFE_VAR": "safe_value",
-        }
-        # Print environment variables inside child process
-        resp = self.client.exec_cmd("env", env=test_env)
-        self.assertIn("result", resp)
-        stdout = resp["result"]["stdout"]
-        self.assertNotIn("LD_PRELOAD", stdout)
-        self.assertNotIn("BASH_ENV", stdout)
-        self.assertIn("CUSTOM_SAFE_VAR=safe_value", stdout)
+
+        for bad_env in ({"LD_PRELOAD": "/tmp/evil.so"}, {"BASH_ENV": "/tmp/evil.sh"}):
+            with self.subTest(bad_env=bad_env):
+                resp = self.client.exec_cmd("env", env=bad_env)
+                self.assertIn("error", resp)
+                self.assertEqual(resp["error"]["code"], -32602)
+
+        # A safe, non-reserved variable is accepted and reaches the child process.
+        ok = self.client.exec_cmd("env", env={"CUSTOM_SAFE_VAR": "safe_value"})
+        self.assertIn("result", ok)
+        self.assertIn("CUSTOM_SAFE_VAR=safe_value", ok["result"]["stdout"])
 
     def test_c05_concurrent_status_during_execution(self):
         """C-05: Status queries return promptly while an execution is running concurrently."""
