@@ -22,6 +22,9 @@ except ImportError:
 class MCPServer:
     """Minimal stdio JSON-RPC 2.0 MCP server."""
 
+    DEFAULT_PROTOCOL_VERSION = "2024-11-05"
+    SUPPORTED_PROTOCOL_VERSIONS = ("2024-11-05", "2025-03-26", "2025-06-18")
+
     def __init__(self, sock_path: str):
         self.sock_path = sock_path
         self.request_id = 0
@@ -51,19 +54,21 @@ class MCPServer:
             sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
             sock.settimeout(timeout)
             sock.connect(self.sock_path)
-        except (ConnectionRefusedError, FileNotFoundError) as e:
+        except OSError as e:
             raise RuntimeError(f"Daemon connection failed: {e}")
 
         req = {"jsonrpc": "2.0", "id": self._next_id(), "method": method, "params": params}
-        sock.sendall((json.dumps(req) + "\n").encode())
 
         data = b""
         try:
+            sock.sendall((json.dumps(req) + "\n").encode())
             while b"\n" not in data:
                 chunk = sock.recv(65536)
                 if not chunk:
                     break
                 data += chunk
+        except OSError as e:
+            raise RuntimeError(f"Daemon communication failed: {e}")
         finally:
             sock.close()
 
@@ -72,9 +77,15 @@ class MCPServer:
         return json.loads(data.decode().strip())
 
     def handle_initialize(self, req_id, params: dict):
-        """Handle MCP initialize request."""
+        """Handle MCP initialize request, echoing a supported protocol version."""
+        requested = params.get("protocolVersion")
+        version = (
+            requested
+            if requested in self.SUPPORTED_PROTOCOL_VERSIONS
+            else self.DEFAULT_PROTOCOL_VERSION
+        )
         self._send_result(req_id, {
-            "protocolVersion": "2024-11-05",
+            "protocolVersion": version,
             "capabilities": {"tools": {}},
             "serverInfo": {"name": "agent-root-mcp", "version": "1.0.0"},
         })
@@ -122,15 +133,23 @@ class MCPServer:
             self._send_error(req_id, -32601, f"Unknown tool: {name}")
             return
 
-        args = params.get("arguments", {})
+        args = params.get("arguments") or {}
+        if not isinstance(args, dict):
+            self._send_error(req_id, -32602, "Invalid params: 'arguments' must be an object")
+            return
+
         command = args.get("command")
-        timeout = args.get("timeout", 60)
+        if not command or not isinstance(command, str):
+            self._send_error(req_id, -32602, "Missing or invalid required argument: command")
+            return
+
+        try:
+            timeout = int(args.get("timeout", 60))
+        except (TypeError, ValueError):
+            self._send_error(req_id, -32602, "Invalid argument: 'timeout' must be an integer")
+            return
         workdir = args.get("workdir", "/")
         env = args.get("env", {})
-
-        if not command:
-            self._send_error(req_id, -32602, "Missing required argument: command")
-            return
 
         try:
             resp = self._call_daemon("exec", {
@@ -154,8 +173,8 @@ class MCPServer:
                 self._send_result(req_id, {
                     "content": [{"type": "text", "text": text}],
                     "isError": True,
-                    "meta": {"daemon_code": code, "reason": reason,
-                             "stderr": err.get("data", {}).get("stderr", "")},
+                    "_meta": {"daemon_code": code, "reason": reason,
+                              "stderr": err.get("data", {}).get("stderr", "")},
                 })
                 return
             self._send_error(req_id, code, err["message"], {"reason": reason})
@@ -172,7 +191,7 @@ class MCPServer:
         self._send_result(req_id, {
             "content": [{"type": "text", "text": text or ""}],
             "isError": exit_code != 0,
-            "meta": {
+            "_meta": {
                 "exit_code": exit_code,
                 "stderr": stderr,
                 "duration_ms": result.get("duration_ms"),
@@ -180,16 +199,37 @@ class MCPServer:
         })
 
     def handle_request(self, line: str):
-        """Dispatch a single JSON-RPC request."""
+        """Dispatch a single JSON-RPC request or notification."""
         try:
             req = json.loads(line)
         except json.JSONDecodeError:
             self._send_error(None, -32700, "Parse error")
             return
 
+        if not isinstance(req, dict):
+            self._send_error(None, -32600, "Invalid Request: expected a JSON object")
+            return
+
+        # JSON-RPC 2.0: a message without an "id" is a notification and MUST NOT
+        # receive a response.
+        is_notification = "id" not in req
         req_id = req.get("id")
         method = req.get("method")
-        params = req.get("params", {})
+        params = req.get("params")
+        if params is None:
+            params = {}
+        if not isinstance(params, dict):
+            if not is_notification:
+                self._send_error(req_id, -32602, "Invalid params: expected an object")
+            return
+        if not isinstance(method, str):
+            if not is_notification:
+                self._send_error(req_id, -32600, "Invalid Request: missing method")
+            return
+
+        if method.startswith("notifications/"):
+            # notifications/initialized, notifications/cancelled, ... are no-ops.
+            return
 
         if method == "initialize":
             self.handle_initialize(req_id, params)
@@ -200,6 +240,8 @@ class MCPServer:
         elif method == "ping":
             self._send_result(req_id, {"pong": True})
         else:
+            if is_notification:
+                return
             self._send_error(req_id, -32601, f"Method not found: {method}")
 
     def run(self):

@@ -4,11 +4,12 @@ agent-root-exec — Transparent execution wrapper for privileged commands.
 
 Sends exec requests to the agent-root-runner daemon via Unix domain socket.
 Exit codes:
-  0-123  : command exit code (pass-through)
-  124    : execution timeout
+  0-255  : command exit code (pass-through)
+  1      : permission denied, or cannot connect to the daemon
+  124    : daemon-side execution timeout
   125    : daemon disarmed
   126    : guardrail blocked
-  128    : daemon error / connection failure
+  128    : unexpected daemon error
 """
 
 import json
@@ -29,7 +30,9 @@ def send_exec(sock_path: str, command: str, timeout: int, workdir: str, env: dic
         sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
         sock.settimeout(timeout + 10)  # allow daemon overhead
         sock.connect(sock_path)
-    except (ConnectionRefusedError, FileNotFoundError) as e:
+    except OSError as e:
+        # Covers ConnectionRefusedError, FileNotFoundError, PermissionError
+        # (non-wheel user hitting the 0660 socket), and socket timeouts.
         sys.exit(f"agent-root-exec: Cannot connect to daemon at {sock_path}: {e}")
 
     request = {
@@ -43,21 +46,26 @@ def send_exec(sock_path: str, command: str, timeout: int, workdir: str, env: dic
             "env": env,
         },
     }
-    sock.sendall((json.dumps(request) + "\n").encode())
 
     data = b""
     try:
+        sock.sendall((json.dumps(request) + "\n").encode())
         while b"\n" not in data:
             chunk = sock.recv(65536)
             if not chunk:
                 break
             data += chunk
+    except OSError as e:
+        sys.exit(f"agent-root-exec: Communication with daemon failed: {e}")
     finally:
         sock.close()
 
     if not data:
         sys.exit("agent-root-exec: Daemon closed connection unexpectedly.")
-    return json.loads(data.decode().strip())
+    try:
+        return json.loads(data.decode().strip())
+    except (ValueError, UnicodeDecodeError) as e:
+        sys.exit(f"agent-root-exec: Malformed response from daemon: {e}")
 
 
 def main():
@@ -117,7 +125,12 @@ def main():
         if not stderr.endswith("\n"):
             sys.stderr.write("\n")
 
-    sys.exit(exit_code if 0 <= exit_code <= 123 else 128)
+    # Pass the command's exit status through untouched. Daemon-level conditions
+    # (timeout/disarmed/guardrail) arrive as JSON-RPC errors above, so this path
+    # is only reached for a successfully executed command.
+    if isinstance(exit_code, int) and 0 <= exit_code <= 255:
+        sys.exit(exit_code)
+    sys.exit(128)
 
 
 if __name__ == "__main__":

@@ -29,7 +29,19 @@ DESTRUCTIVE_COMMANDS: frozenset[str] = frozenset({
 WRAPPER_COMMANDS: frozenset[str] = frozenset({
     "sudo", "doas", "env", "nohup", "nice",
     "ionice", "time", "exec", "stdbuf", "xargs", "pkexec", "setsid",
+    # Shell keywords/builtins that prefix (and thus hide) the real command.
+    "command", "builtin", "nocorrect",
 })
+
+
+def has_inplace_flag(args: List[str]) -> bool:
+    """True if args contain an in-place edit flag (e.g. -i, -ni, --in-place)."""
+    for a in args:
+        if a == "--in-place":
+            return True
+        if a.startswith("-") and not a.startswith("--") and "i" in a[1:]:
+            return True
+    return False
 
 FORK_BOMB_PATTERNS: Tuple[re.Pattern[str], ...] = (
     re.compile(r":\s*\(\s*\)\s*\{\s*:\s*\|\s*:\s*&\s*\}\s*;\s*:"),
@@ -390,6 +402,11 @@ def parse_atomic_command(raw_str: str) -> ParsedCommand:
         Redirection(operator=r.operator, target=_substitute_env_vars(r.target, env_vars))
         for r in redirs
     ]
+
+    # Strip leading shell negation keywords ("!"), which otherwise become the
+    # classified executable and hide the real destructive command.
+    while substituted_cmd_tokens and substituted_cmd_tokens[0] == "!":
+        substituted_cmd_tokens = substituted_cmd_tokens[1:]
 
     executable = ""
     args: List[str] = []

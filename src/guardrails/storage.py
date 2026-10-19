@@ -442,9 +442,15 @@ def _is_critical_mountpoint(path: str, dag: StorageDAG) -> bool:
     if path.startswith("/") and all(c in "./*" for c in path[1:]):
         return True
 
-    # Paths under critical mounts (e.g., /etc/passwd, /usr/lib)
+    # Paths under critical mounts (e.g., /etc/passwd, /usr/lib).
+    # /home is intentionally excluded here: personal/workspace data is not
+    # protected (see README), so descending deletes such as
+    # `rm -rf /home/u/project/build` must remain allowed. Recursively deleting
+    # the /home mount itself is still caught by the exact-match check above.
     for mount in dag.CRITICAL_MOUNTS:
-        if mount != "/" and (path == mount or path.startswith(mount + "/")):
+        if mount in ("/", "/home"):
+            continue
+        if path == mount or path.startswith(mount + "/"):
             return True
 
     return False

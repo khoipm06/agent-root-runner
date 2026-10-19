@@ -133,7 +133,10 @@ def _child_preexec_fn() -> None:
     except (ValueError, OSError):
         pass
 
-    # 3. RLIMIT_NPROC: 256 (when running as root)
+    # 3. RLIMIT_NPROC: 256. NOTE: the kernel does not enforce RLIMIT_NPROC for
+    #    processes holding CAP_SYS_RESOURCE (root has it), so for the root daemon
+    #    this is not an effective fork-bomb defense; it is kept as best-effort
+    #    hardening for unprivileged (dev/user-mode) execution.
     try:
         if os.geteuid() == 0:
             resource.setrlimit(resource.RLIMIT_NPROC, (256, 256))
@@ -171,6 +174,21 @@ class SubprocessExecutor:
         self.is_user_mode = is_user_mode
         self.drain_timeout = drain_timeout
         self._semaphore = asyncio.Semaphore(max_concurrency)
+        self._current_pgid: Optional[int] = None
+
+    def terminate_current(self) -> None:
+        """SIGKILL the process group of the in-flight command, if any.
+
+        Wired to the state machine's disarm hook so a privileged command cannot
+        outlive its authorization window.
+        """
+        pgid = self._current_pgid
+        if pgid is None:
+            return
+        try:
+            os.killpg(pgid, signal.SIGKILL)
+        except (ProcessLookupError, OSError):
+            pass
 
     def sanitize_environment(
         self,
@@ -253,6 +271,9 @@ class SubprocessExecutor:
                 else:
                     truncated = True
         except (asyncio.CancelledError, ConnectionResetError, BrokenPipeError, OSError):
+            # NOTE: swallowing CancelledError is intentional here: on drain
+            # timeout the reader tasks are cancelled and their partial capture is
+            # collected by the caller.
             pass
 
         return b"".join(chunks), truncated
@@ -304,6 +325,7 @@ class SubprocessExecutor:
                 start_new_session=True,  # setsid() -> New PGID
                 preexec_fn=_child_preexec_fn,
             )
+            self._current_pgid = proc.pid
 
             # Concurrent readers to prevent pipe buffer deadlocks
             stdout_task = asyncio.create_task(
@@ -369,6 +391,7 @@ class SubprocessExecutor:
                         await proc.wait()
                 except Exception:
                     pass
+                self._current_pgid = None
 
             duration_ms = round((time.monotonic() - start_time) * 1000, 2)
 

@@ -8,6 +8,7 @@ Provides: arm, disarm, status, install (systemd), uninstall.
 import argparse
 import json
 import os
+import shutil
 import socket
 import sys
 import time
@@ -135,8 +136,31 @@ def cmd_disarm(args):
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
-UNIT_SOURCE_PATH = PROJECT_ROOT / "systemd" / "agent-root-runner.service"
-UNIT_DEST_PATH = Path("/etc/systemd/system/agent-root-runner.service")
+INSTALL_PREFIX = Path("/usr/local/lib/agent-root-runner")
+BIN_DIR = Path("/usr/local/bin")
+SERVICE_NAME = "agent-root-runner.service"
+UNIT_DEST_PATH = Path("/etc/systemd/system") / SERVICE_NAME
+ENTRY_POINTS = (
+    "agent-root-runner",
+    "agent-root-runner-daemon",
+    "agent-root-exec",
+    "agent-root-mcp",
+)
+MANIFEST_DIR = Path("/etc/agent-root-runner")
+MANIFEST_PATH = MANIFEST_DIR / "installed-files"
+LAUNCHER_MARKER = "# Launcher installed by agent-root-runner"
+
+
+def _resolve_unit_source() -> Path:
+    """Locate the systemd unit for both source checkouts and frozen builds."""
+    candidates = [PROJECT_ROOT / "systemd" / SERVICE_NAME]
+    meipass = getattr(sys, "_MEIPASS", None)
+    if meipass:
+        candidates.append(Path(meipass) / "systemd" / SERVICE_NAME)
+    for candidate in candidates:
+        if candidate.is_file():
+            return candidate
+    return candidates[0]
 
 
 def _run_systemctl(*args: str) -> int:
@@ -146,29 +170,188 @@ def _run_systemctl(*args: str) -> int:
     return subprocess.call(["systemctl", *args])
 
 
+def _force_unlink(path: Path) -> None:
+    """Remove a file, symlink, or directory occupying ``path`` (if any)."""
+    try:
+        if path.is_symlink() or path.exists():
+            if path.is_dir() and not path.is_symlink():
+                shutil.rmtree(path)
+            else:
+                path.unlink()
+    except OSError as exc:
+        sys.exit(f"Error: could not replace {path}: {exc}")
+
+
+def _write_manifest(paths) -> None:
+    """Record the paths we installed so uninstall removes only our own files."""
+    try:
+        MANIFEST_DIR.mkdir(parents=True, exist_ok=True)
+        MANIFEST_PATH.write_text("\n".join(str(p) for p in paths) + "\n")
+    except OSError as exc:
+        print(f"Warning: could not write install manifest: {exc}", file=sys.stderr)
+
+
+def _read_manifest() -> list:
+    if not MANIFEST_PATH.is_file():
+        return []
+    try:
+        return [
+            Path(line.strip())
+            for line in MANIFEST_PATH.read_text().splitlines()
+            if line.strip()
+        ]
+    except OSError:
+        return []
+
+
+def _looks_like_our_install(path: Path) -> bool:
+    """Best-effort check that a PATH entry came from us (no-manifest fallback)."""
+    try:
+        if path.is_symlink():
+            target = path.resolve()
+            return INSTALL_PREFIX in target.parents or target == INSTALL_PREFIX
+        if path.is_file():
+            if path.stat().st_size < 8192:
+                return LAUNCHER_MARKER in path.read_text(errors="ignore")
+            with open(path, "rb") as fh:
+                return fh.read(4) == b"\x7fELF"
+    except OSError:
+        return False
+    return False
+
+
+def _install_entry_points() -> list:
+    """Expose the four entry points on PATH; return the installed paths."""
+    if getattr(sys, "frozen", False):
+        return _install_frozen_entry_points()
+    return _install_source_entry_points()
+
+
+def _install_source_entry_points() -> list:
+    """Deploy the source tree and install small launcher scripts on PATH.
+
+    The deployed tree is only read at runtime. The launchers in
+    ``/usr/local/bin`` are tiny shell scripts that exec the running Python
+    interpreter against the deployed entry point. Launchers are used instead of
+    symlinks into the tree so execution does not depend on how the deployment
+    directory is labeled (SELinux) or mounted (``noexec``), and the entry
+    points keep ``sys.path`` relative to the deployed tree, so ``src`` remains
+    importable.
+    """
+    root = PROJECT_ROOT.resolve()
+    prefix = INSTALL_PREFIX.resolve()
+    if root != prefix:
+        if root in prefix.parents:
+            sys.exit(
+                f"Error: refusing to install into {prefix} because it is nested "
+                f"inside the source tree {root}."
+            )
+        INSTALL_PREFIX.parent.mkdir(parents=True, exist_ok=True)
+        staging = INSTALL_PREFIX.parent / (INSTALL_PREFIX.name + ".new")
+        if staging.exists():
+            shutil.rmtree(staging)
+        # Copy to a staging dir first so a failure cannot leave a half-written
+        # deployment behind the launchers.
+        shutil.copytree(
+            root,
+            staging,
+            symlinks=True,
+            ignore=shutil.ignore_patterns(".git", "__pycache__", "*.pyc"),
+        )
+        if INSTALL_PREFIX.exists():
+            shutil.rmtree(INSTALL_PREFIX)
+        os.replace(staging, INSTALL_PREFIX)
+
+    interpreter = sys.executable or "/usr/bin/python3"
+    installed = []
+    for name in ENTRY_POINTS:
+        target = INSTALL_PREFIX / "bin" / name
+        if not target.is_file():
+            print(f"Warning: entry point not found, skipping: {target}")
+            continue
+        launcher = BIN_DIR / name
+        _force_unlink(launcher)
+        launcher.write_text(
+            "#!/bin/sh\n"
+            f"{LAUNCHER_MARKER}; see `agent-root-runner install`.\n"
+            f'exec "{interpreter}" "{target}" "$@"\n'
+        )
+        launcher.chmod(0o755)
+        installed.append(launcher)
+        print(f"Installed: {launcher} -> {target}")
+    return installed
+
+
+def _install_frozen_entry_points() -> list:
+    """Copy the sibling standalone release binaries to /usr/local/bin."""
+    exe_dir = Path(sys.executable).resolve().parent
+    missing = [name for name in ENTRY_POINTS if not (exe_dir / name).is_file()]
+    if missing:
+        sys.exit(
+            "Error: no source tree found and these release binaries are missing "
+            f"next to {sys.executable}: {', '.join(missing)}"
+        )
+    installed = []
+    for name in ENTRY_POINTS:
+        src = (exe_dir / name).resolve()
+        dest = BIN_DIR / name
+        if dest.exists() and os.path.samefile(src, dest):
+            # Re-running install from the install location: nothing to copy.
+            installed.append(dest)
+            print(f"Already installed: {dest}")
+            continue
+        _force_unlink(dest)
+        # copyfile/copymode (not copy2) so no source SELinux/xattr labels ride along.
+        shutil.copyfile(src, dest)
+        shutil.copymode(src, dest)
+        dest.chmod(0o755)
+        installed.append(dest)
+        print(f"Installed: {dest}")
+    return installed
+
+
 def cmd_install(args):
-    """Install systemd service unit by copying the repo unit file, then enable it."""
+    """Install entry points and the systemd unit, then start and verify."""
     if os.geteuid() != 0:
         sys.exit("Error: install requires root. Run with sudo.")
-    if not UNIT_SOURCE_PATH.is_file():
-        sys.exit(f"Error: unit file not found: {UNIT_SOURCE_PATH}")
+
+    unit_source = _resolve_unit_source()
+    if not unit_source.is_file():
+        sys.exit(f"Error: systemd unit not found (looked at {unit_source}).")
+
+    BIN_DIR.mkdir(parents=True, exist_ok=True)
+    print("Installing entry points...")
+    installed = _install_entry_points()
+    _write_manifest(installed)
+
     try:
-        UNIT_DEST_PATH.write_bytes(UNIT_SOURCE_PATH.read_bytes())
-    except PermissionError:
-        sys.exit("Error: Permission denied. Run with sudo.")
+        UNIT_DEST_PATH.write_bytes(unit_source.read_bytes())
+    except OSError as exc:
+        sys.exit(f"Error: could not install systemd unit: {exc}")
     print(f"Installed systemd unit: {UNIT_DEST_PATH}")
-    _run_systemctl("daemon-reload")
-    if _run_systemctl("enable", "--now", "agent-root-runner.service") != 0:
-        sys.exit("Error: systemctl enable --now agent-root-runner.service failed.")
+
+    if _run_systemctl("daemon-reload") != 0:
+        sys.exit("Error: systemctl daemon-reload failed.")
+    if _run_systemctl("enable", SERVICE_NAME) != 0:
+        print(f"Warning: systemctl enable {SERVICE_NAME} failed.", file=sys.stderr)
+    if _run_systemctl("restart", SERVICE_NAME) != 0:
+        _run_systemctl("status", SERVICE_NAME, "--no-pager")
+        sys.exit(f"Error: failed to start {SERVICE_NAME}.")
+
+    time.sleep(0.5)
+    if _run_systemctl("is-active", "--quiet", SERVICE_NAME) != 0:
+        _run_systemctl("status", SERVICE_NAME, "--no-pager")
+        sys.exit(f"Error: {SERVICE_NAME} is not active after start.")
+    print(f"{SERVICE_NAME} is active.")
 
 
 def cmd_uninstall(args):
-    """Stop, disable and remove the systemd service unit."""
+    """Stop and disable the service, then remove the unit and entry points."""
     if os.geteuid() != 0:
         sys.exit("Error: uninstall requires root. Run with sudo.")
     # Tolerate 'not loaded' / already-stopped failures.
-    _run_systemctl("stop", "agent-root-runner.service")
-    _run_systemctl("disable", "agent-root-runner.service")
+    _run_systemctl("stop", SERVICE_NAME)
+    _run_systemctl("disable", SERVICE_NAME)
     if UNIT_DEST_PATH.exists():
         try:
             UNIT_DEST_PATH.unlink()
@@ -178,13 +361,53 @@ def cmd_uninstall(args):
     else:
         print(f"Not found: {UNIT_DEST_PATH}")
     _run_systemctl("daemon-reload")
+    _run_systemctl("reset-failed", SERVICE_NAME)
+
+    # Remove only entry points we installed (manifest), plus a safe fallback
+    # heuristic for installs made by older versions that lacked a manifest.
+    known = set(_read_manifest())
+    candidates = list(known)
+    for name in ENTRY_POINTS:
+        candidate = BIN_DIR / name
+        if candidate not in candidates:
+            candidates.append(candidate)
+
+    for path in candidates:
+        if not (path.is_symlink() or path.exists()):
+            continue
+        if path not in known and not _looks_like_our_install(path):
+            print(f"Skipping (not installed by agent-root-runner): {path}")
+            continue
+        try:
+            path.unlink()
+            print(f"Removed: {path}")
+        except OSError as exc:
+            print(f"Warning: could not remove {path}: {exc}")
+
+    if MANIFEST_PATH.exists():
+        try:
+            MANIFEST_PATH.unlink()
+        except OSError:
+            pass
+    if MANIFEST_DIR.exists():
+        try:
+            MANIFEST_DIR.rmdir()
+        except OSError:
+            pass
+
+    if INSTALL_PREFIX.is_dir() and not INSTALL_PREFIX.is_symlink():
+        shutil.rmtree(INSTALL_PREFIX, ignore_errors=True)
+        print(f"Removed: {INSTALL_PREFIX}")
+
     socket_dir = Path("/run/agent-root-runner")
     if socket_dir.exists():
         try:
             socket_dir.rmdir()
             print(f"Removed: {socket_dir}")
-        except OSError as e:
-            print(f"Warning: could not remove {socket_dir}: {e}")
+        except OSError as exc:
+            print(f"Warning: could not remove {socket_dir}: {exc}")
+
+    print("Note: audit logs under /var/log/agent-root-runner are preserved.")
 
 
 def main():

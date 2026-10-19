@@ -14,7 +14,7 @@ import os
 import re
 from typing import Optional, Tuple
 
-from src.guardrails.parser import ParsedCommand
+from src.guardrails.parser import ParsedCommand, has_inplace_flag
 
 DOMAIN = "persistence_tamper"
 RULE_PERSISTENCE_TAMPER = "RULE_PERSISTENCE_TAMPER"
@@ -128,9 +128,7 @@ def check_persistence_tamper(cmd: ParsedCommand) -> Optional[Tuple[str, str, str
                     )
 
     candidates = [_norm(r.target) for r in cmd.redirections if r.target]
-    inplace_edit = exe in _INPLACE_EDITORS and any(
-        a.startswith("-i") or a == "--in-place" for a in args
-    )
+    inplace_edit = exe in _INPLACE_EDITORS and has_inplace_flag(args)
     if exe in _WRITE_EXES or inplace_edit:
         candidates += [_norm(a) for a in args if a.startswith("/")]
 

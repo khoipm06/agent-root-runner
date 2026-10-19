@@ -14,7 +14,7 @@ permissions:
 jobs:
   test:
     name: Test (Python ${{ matrix.python-version }})
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     strategy:
       fail-fast: false
       matrix:
@@ -38,7 +38,7 @@ jobs:
   build-binaries:
     name: Build Standalone Binaries (Linux x86_64)
     needs: test
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
 
     steps:
       - name: Checkout repository
@@ -55,7 +55,7 @@ jobs:
       - name: Build Standalone Binaries
         run: |
           mkdir -p dist
-          pyinstaller --onefile --clean --paths . bin/agent-root-runner -n agent-root-runner --distpath dist
+          pyinstaller --onefile --clean --paths . --add-data "systemd/agent-root-runner.service:systemd" bin/agent-root-runner -n agent-root-runner --distpath dist
           pyinstaller --onefile --clean --paths . bin/agent-root-runner-daemon -n agent-root-runner-daemon --distpath dist
           pyinstaller --onefile --clean --paths . bin/agent-root-exec -n agent-root-exec --distpath dist
           pyinstaller --onefile --clean --paths . bin/agent-root-mcp -n agent-root-mcp --distpath dist

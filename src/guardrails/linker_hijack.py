@@ -12,7 +12,7 @@ from __future__ import annotations
 import os
 from typing import Optional, Tuple
 
-from src.guardrails.parser import ParsedCommand
+from src.guardrails.parser import ParsedCommand, has_inplace_flag
 
 RULE_LINKER_HIJACK = "RULE_LINKER_HIJACK"
 
@@ -126,9 +126,7 @@ def check_linker_safety(cmd: ParsedCommand) -> Optional[Tuple[str, str, str]]:
 
     # 2. Mutating utilities targeting linker configuration or shared objects
     # F10: sed/perl count as mutating only when editing in place (-i).
-    inplace_edit = cmd.executable in _INPLACE_EDITORS and any(
-        a.startswith("-i") or a == "--in-place" for a in cmd.args
-    )
+    inplace_edit = cmd.executable in _INPLACE_EDITORS and has_inplace_flag(cmd.args)
     if cmd.executable in MUTATING_OPERATIONS or inplace_edit:
         for a in cmd.args:
             if a.startswith("-"):

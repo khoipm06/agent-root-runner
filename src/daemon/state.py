@@ -12,7 +12,7 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from enum import Enum
 import time
-from typing import Any, Optional, Protocol, Tuple
+from typing import Any, Callable, Optional, Protocol, Tuple
 import uuid
 
 from src.daemon.auth import is_arm_authorized
@@ -83,6 +83,10 @@ class RunnerStateMachine:
         self._lifetime_commands: int = 0
         self._last_disarm_reason: Optional[str] = None
 
+        # Optional synchronous callback invoked whenever the machine transitions
+        # ARMED -> DISARMED (e.g. to kill an in-flight privileged command).
+        self.on_disarm: Optional[Callable[[], None]] = None
+
     @property
     def state(self) -> RunnerState:
         return self._state
@@ -147,7 +151,7 @@ class RunnerStateMachine:
             )
 
             # Emit audit log event
-            self._emit_audit("ARM", {
+            await self._emit_audit("ARM", {
                 "session_id": session_id,
                 "duration_seconds": duration_seconds,
                 "timeout_seconds": duration_seconds,
@@ -166,7 +170,7 @@ class RunnerStateMachine:
     ) -> dict[str, Any]:
         """Transitions daemon to DISARMED and terminates active session."""
         async with self._lock:
-            return self._transition_to_disarmed_locked(
+            return await self._transition_to_disarmed_locked(
                 reason=reason,
                 disarmed_by_uid=disarmed_by_uid,
             )
@@ -186,14 +190,22 @@ class RunnerStateMachine:
     async def get_status(self) -> dict[str, Any]:
         """Returns state snapshot, evaluating passive expiry first."""
         async with self._lock:
-            self._check_passive_expiry_locked()
+            await self._check_passive_expiry_locked()
             return self._build_status_dict_locked()
 
     async def is_armed(self) -> bool:
         """Returns True if daemon is currently in valid ARMED state."""
         async with self._lock:
-            self._check_passive_expiry_locked()
+            await self._check_passive_expiry_locked()
             return self._state == RunnerState.ARMED
+
+    async def remaining_seconds(self) -> float:
+        """Seconds left in the current ARMED session (0.0 if disarmed)."""
+        async with self._lock:
+            await self._check_passive_expiry_locked()
+            if self._state != RunnerState.ARMED or self._session is None:
+                return 0.0
+            return max(0.0, self._session.expires_at_monotonic - time.monotonic())
 
     async def check_permission_and_decrement_quota(self) -> Tuple[bool, str]:
         """Atomically evaluates admission and decrements quota for an incoming command.
@@ -202,7 +214,7 @@ class RunnerStateMachine:
             Tuple of (allowed: bool, reason_message: str).
         """
         async with self._lock:
-            self._check_passive_expiry_locked()
+            await self._check_passive_expiry_locked()
 
             if self._state != RunnerState.ARMED or self._session is None:
                 if self._last_disarm_reason == DisarmReason.QUOTA_EXHAUSTED.value:
@@ -211,13 +223,13 @@ class RunnerStateMachine:
 
             if self._session.quota_remaining is not None:
                 if self._session.quota_remaining <= 0:
-                    self._transition_to_disarmed_locked(reason=DisarmReason.QUOTA_EXHAUSTED.value)
+                    await self._transition_to_disarmed_locked(reason=DisarmReason.QUOTA_EXHAUSTED.value)
                     return False, "Execution quota exhausted. Re-arm with 'sudo agent-root-runner arm'."
 
                 self._session.quota_remaining -= 1
                 if self._session.quota_remaining <= 0:
                     # Current command is admitted as the final quota slot; lock future requests
-                    self._transition_to_disarmed_locked(reason=DisarmReason.QUOTA_EXHAUSTED.value)
+                    await self._transition_to_disarmed_locked(reason=DisarmReason.QUOTA_EXHAUSTED.value)
 
             self._in_flight_commands += 1
             return True, "Allowed"
@@ -272,7 +284,7 @@ class RunnerStateMachine:
                         )
 
                         # 4. Emit audit log event for re-arming via quota refund
-                        self._emit_audit("ARM", {
+                        await self._emit_audit("ARM", {
                             "session_id": self._session.session_id,
                             "reason": "QUOTA_REFUND",
                             "quota_remaining": self._session.quota_remaining,
@@ -311,21 +323,21 @@ class RunnerStateMachine:
                     and self._session is not None
                     and self._session.session_id == session_id
                 ):
-                    self._transition_to_disarmed_locked(reason=DisarmReason.TIMEOUT_EXPIRED.value)
+                    await self._transition_to_disarmed_locked(reason=DisarmReason.TIMEOUT_EXPIRED.value)
         except asyncio.CancelledError:
             pass
 
-    def _check_passive_expiry_locked(self) -> None:
+    async def _check_passive_expiry_locked(self) -> None:
         """Tier-2 Passive monotonic timestamp guard."""
         if self._state == RunnerState.ARMED and self._is_time_expired_locked():
-            self._transition_to_disarmed_locked(reason=DisarmReason.TIMEOUT_EXPIRED.value)
+            await self._transition_to_disarmed_locked(reason=DisarmReason.TIMEOUT_EXPIRED.value)
 
     def _is_time_expired_locked(self) -> bool:
         if self._session is None or self._session.expires_at_monotonic == 0.0:
             return False
         return time.monotonic() >= self._session.expires_at_monotonic
 
-    def _transition_to_disarmed_locked(
+    async def _transition_to_disarmed_locked(
         self,
         reason: str,
         disarmed_by_uid: Optional[int] = None,
@@ -347,6 +359,14 @@ class RunnerStateMachine:
         self._state = RunnerState.DISARMED
         self._last_disarm_reason = reason
 
+        # Terminate any in-flight privileged command so it cannot outlive the
+        # authorization window (manual disarm, timeout lock, quota exhaustion).
+        if not already_disarmed and self.on_disarm is not None:
+            try:
+                self.on_disarm()
+            except Exception:
+                pass
+
         # Map event name for audit log
         event_name = "DISARM"
         if reason == DisarmReason.TIMEOUT_EXPIRED.value:
@@ -356,7 +376,7 @@ class RunnerStateMachine:
         elif reason == DisarmReason.SHUTDOWN.value:
             event_name = "DAEMON_STOP"
 
-        self._emit_audit(event_name, {
+        await self._emit_audit(event_name, {
             "session_id": session_id,
             "reason": reason,
             "disarmed_by_uid": disarmed_by_uid,
@@ -412,15 +432,27 @@ class RunnerStateMachine:
             "lifetime_commands": self._lifetime_commands,
         }
 
-    def _emit_audit(self, event_type: str, data: dict[str, Any]) -> None:
-        if self._audit_logger is not None:
-            try:
-                if hasattr(self._audit_logger, "log"):
-                    self._audit_logger.log(event_type, data)
-                elif hasattr(self._audit_logger, "log_event"):
-                    self._audit_logger.log_event(event_type, **data)
-            except Exception:
-                pass
+    async def _emit_audit(self, event_type: str, data: dict[str, Any]) -> None:
+        """Emit an audit event, preferring the async (non-blocking) logger.
+
+        The async ``log_event`` path offloads durability fsync to a worker
+        thread, so it never blocks the event loop (or the state lock) on disk
+        I/O.
+        """
+        if self._audit_logger is None:
+            return
+        try:
+            if hasattr(self._audit_logger, "log_event"):
+                payload = dict(data)
+                peer_uid = payload.pop("uid", None)
+                peer_pid = payload.pop("pid", None)
+                await self._audit_logger.log_event(
+                    event_type, peer_uid=peer_uid, peer_pid=peer_pid, **payload
+                )
+            elif hasattr(self._audit_logger, "log"):
+                self._audit_logger.log(event_type, data)
+        except Exception:
+            pass
 
     @staticmethod
     def _format_iso(epoch_seconds: float) -> str:

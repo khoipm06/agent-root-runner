@@ -67,37 +67,59 @@ Operator (Human Admin)
 
 ## Installation & Setup
 
-### 1. Install Daemon & Binaries
+### 1. Install
 
-From the repository root:
+A single command installs everything: it places the four CLI entry points on
+`/usr/local/bin`, installs the systemd unit, enables the service, and starts and
+verifies it.
+
+**From a source checkout:**
 
 ```bash
-# Install CLI tools and systemd service unit
-sudo bin/agent-root-runner install
-sudo install -m 0755 bin/agent-root-mcp /usr/local/bin/agent-root-mcp
-sudo install -m 0755 bin/agent-root-exec /usr/local/bin/agent-root-exec
-
-# Enable and start the systemd service
-sudo systemctl daemon-reload
-sudo systemctl enable --now agent-root-runner
+git clone https://github.com/khoipm06/agent-root-runner.git
+cd agent-root-runner
+sudo ./bin/agent-root-runner install
 ```
 
-### 2. Verify Service Status
+**Or from a prebuilt release** (standalone binaries, no Python toolchain needed):
+
+```bash
+curl -LO https://github.com/khoipm06/agent-root-runner/releases/latest/download/agent-root-runner-linux-x86_64.tar.gz
+tar xzf agent-root-runner-linux-x86_64.tar.gz
+sudo ./agent-root-runner install
+```
+
+`install` is idempotent and safe to re-run (for example after a `git pull`).
+
+### 2. Verify
 
 ```bash
 agent-root-runner status
 ```
 
-Expected output:
-```json
-{
-  "state": "DISARMED",
-  "remaining_seconds": 0.0,
-  "quota_remaining": null
-}
+Expected output (the daemon starts **DISARMED** by design):
+
+```text
+State: DISARMED
+Armed: False
+Socket: /run/agent-root-runner/runner.sock
+Daemon PID: <pid>
+Daemon is disarmed. Run 'agent-root-runner arm' to enable.
 ```
 
-*Note: Ensure your non-root user belongs to the `wheel` group to access the socket (`sudo usermod -aG wheel $USER`).*
+*Note: Your non-root user must belong to the `wheel` group to reach the socket
+(`sudo usermod -aG wheel $USER`; log out and back in afterwards).*
+
+### 3. Uninstall
+
+```bash
+sudo agent-root-runner uninstall
+```
+
+> **Note:** The standalone binaries are PyInstaller one-file executables that
+> unpack into `$TMPDIR` at runtime. On systems where `/tmp` (or `$TMPDIR`) is
+> mounted `noexec`, set `TMPDIR` to an executable filesystem (or use a source
+> install) before running them.
 
 ---
 
@@ -130,12 +152,8 @@ All supported harnesses connect via the stdio MCP binary `/usr/local/bin/agent-r
 
 ### Registration via Native CLI
 
-Install the binary:
-```bash
-sudo install -m 0755 bin/agent-root-mcp /usr/local/bin/agent-root-mcp
-```
-
-Register the MCP server directly using your harness's official CLI command:
+The `agent-root-mcp` entry point is already on `PATH` after
+`agent-root-runner install`. Register it with your harness's official CLI:
 
 | Harness | Registration Command | Scope / Notes |
 |---|---|---|
@@ -173,7 +191,7 @@ The guardrails inspect commands to block actions that render the underlying oper
 | `RULE_RECURSIVE_PERM_CHANGE` | Protection against stripping execution permissions from system roots or essential system binaries. |
 | `RULE_PERSISTENCE_TAMPER` | Protection against wiping system crontabs and truncating sensitive system audit logs. |
 | `RULE_RESOURCE_FORK_BOMB` | Static analysis blocking recursive shell fork bomb definitions. |
-| `RULE_NETWORK_DISRUPTION` | Protection against unmitigated firewall rule flushes and stopping primary network management daemons. |
+| `RULE_NETWORK_ISOLATION` | Protection against unmitigated firewall rule flushes and stopping primary network management daemons. |
 
 ---
 
@@ -190,6 +208,12 @@ The guardrails inspect commands to block actions that render the underlying oper
 | `126` | **Guardrail Blocked** | `-32002` (`GUARDRAIL_BLOCKED`) | Command matched an OS destabilization rule. |
 | `128` | **Internal Daemon Error** | `-32603` (`INTERNAL_ERROR`) | Unexpected daemon error or RPC protocol failure. |
 
+A command that executes successfully passes its **own** exit status straight
+through (`0`–`255`). The codes above are emitted by the wrapper for *daemon-level*
+conditions, so a command that itself exits `124`/`125`/`126` is indistinguishable
+from a wrapper signal — check stderr for the `agent-root-exec:` prefix to tell
+them apart.
+
 ---
 
 ## Security Model & Audit Trail
@@ -197,6 +221,8 @@ The guardrails inspect commands to block actions that render the underlying oper
 - **Root Arming Enforcement**: Arming requests (`arm`) must originate from UID 0 (`peer_uid == 0`). Non-root clients receive `-32003 PERMISSION_DENIED`.
 - **Socket Permissions**: `/run/agent-root-runner/` is created with mode `0750` (owned by `root:wheel`), and `runner.sock` with mode `0660`. Non-root clients must be members of the `wheel` group.
 - **Append-Only Audit Log**: Stored at `/var/log/agent-root-runner/audit.log` (mode `0600`), synced with `fdatasync`.
+- **Fail-Closed Disarm**: Every arm session is bounded by a dual-tier timer and an optional command quota. When the window closes — timeout, quota exhaustion, or a manual `disarm` — any privileged command still running is **SIGKILLed** so it cannot outlive its authorization.
+- **Development Mode**: `agent-root-runner-daemon --allow-user-arm` lets any local socket user arm. It is **refused when the daemon runs as root**, so it can never grant a non-root user root execution; run the daemon as your own unprivileged user for local development.
 
 ```bash
 # View recent audit decisions

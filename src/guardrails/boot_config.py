@@ -14,7 +14,7 @@ import os
 import re
 from typing import Optional, Tuple
 
-from src.guardrails.parser import ParsedCommand
+from src.guardrails.parser import ParsedCommand, has_inplace_flag
 
 RULE_BOOT_CONFIG_INTEGRITY = "RULE_BOOT_CONFIG_INTEGRITY"
 
@@ -76,7 +76,7 @@ def _is_boot_config_path(path_str: str) -> bool:
 
 def _is_inplace_edit(cmd: ParsedCommand) -> bool:
     """Checks whether a stream editor performs an in-place edit."""
-    return any(a.startswith("-i") or a == "--in-place" for a in cmd.args)
+    return has_inplace_flag(cmd.args)
 
 
 def check_boot_config_safety(cmd: ParsedCommand) -> Optional[Tuple[str, str, str]]:

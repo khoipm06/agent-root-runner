@@ -10,7 +10,7 @@ from __future__ import annotations
 import os
 from typing import Optional, Tuple
 
-from src.guardrails.parser import ParsedCommand
+from src.guardrails.parser import ParsedCommand, has_inplace_flag
 
 PROTECTED_AUTH_PATHS: Tuple[str, ...] = (
     "/etc/pam.d",
@@ -102,17 +102,21 @@ def check_auth_files_safety(cmd: ParsedCommand) -> Optional[Tuple[str, str, str]
                 f"Modification of critical authentication asset {asset} blocked",
             )
 
-    # 2. Mutating commands (rm, chmod, chown, mv, cp, truncate, shred)
+    # 2. Mutating commands (rm, chmod, chown, mv, cp, truncate, shred).
+    #    For copy-like operations only the destination mutates the filesystem,
+    #    so reading an auth file (e.g. `cp /etc/passwd /tmp/backup`) is allowed.
     if cmd.executable in MUTATING_OPERATIONS:
-        for arg in cmd.args:
-            if not arg.startswith("-"):
-                asset = matches_protected_auth(arg)
-                if asset:
-                    return (
-                        "auth",
-                        "RULE_AUTH_FILE_MUTATION",
-                        f"Modification of critical authentication asset {asset} blocked",
-                    )
+        targets = [a for a in cmd.args if not a.startswith("-")]
+        if cmd.executable in ("cp", "install") and targets:
+            targets = targets[-1:]
+        for arg in targets:
+            asset = matches_protected_auth(arg)
+            if asset:
+                return (
+                    "auth",
+                    "RULE_AUTH_FILE_MUTATION",
+                    f"Modification of critical authentication asset {asset} blocked",
+                )
 
     # 3. Find commands with -delete or -exec
     if cmd.executable == "find":
@@ -128,9 +132,7 @@ def check_auth_files_safety(cmd: ParsedCommand) -> Optional[Tuple[str, str, str]
                         )
 
     # 4. In-place stream modification (sed -i, perl -i)
-    if cmd.executable == "sed" and any(
-        a.startswith("-i") or a == "--in-place" for a in cmd.args
-    ):
+    if cmd.executable == "sed" and has_inplace_flag(cmd.args):
         for arg in cmd.args:
             if not arg.startswith("-"):
                 asset = matches_protected_auth(arg)
@@ -141,7 +143,7 @@ def check_auth_files_safety(cmd: ParsedCommand) -> Optional[Tuple[str, str, str]
                         f"Modification of critical authentication asset {asset} blocked",
                     )
 
-    if cmd.executable in ("perl", "python", "python3") and "-i" in cmd.args:
+    if cmd.executable in ("perl", "python", "python3") and has_inplace_flag(cmd.args):
         for arg in cmd.args:
             if not arg.startswith("-"):
                 asset = matches_protected_auth(arg)

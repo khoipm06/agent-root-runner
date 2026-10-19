@@ -20,6 +20,24 @@ PROD_AUDIT_LOG_PATH = "/var/log/agent-root-runner/audit.log"
 ENV_AUDIT_LOG_OVERRIDE = "AGENT_ROOT_RUNNER_AUDIT_LOG"
 
 
+def _prepare_private_dir(path: Path) -> bool:
+    """Create ``path`` as a 0700 directory owned by the current euid.
+
+    Returns False if a pre-existing path is unsafe to use (not a directory,
+    owned by another user, or group/other-accessible).
+    """
+    try:
+        path.mkdir(parents=True, exist_ok=True, mode=0o700)
+        st = os.lstat(path)
+    except OSError:
+        return False
+    if not stat.S_ISDIR(st.st_mode):
+        return False
+    if st.st_uid != os.geteuid():
+        return False
+    return stat.S_IMODE(st.st_mode) & 0o077 == 0
+
+
 class AuditLogger:
     """Thread-safe, event-loop non-blocking NDJSON audit logger."""
 
@@ -34,14 +52,15 @@ class AuditLogger:
         self._ensure_file_open()
 
     def _resolve_log_path(self, custom_path: Optional[str], force_user_mode: bool) -> str:
-        # 1. Environment variable override
+        # 1. Explicit constructor parameter. An explicit --audit-log must win over
+        #    a potentially attacker-influenced environment variable.
+        if custom_path:
+            return os.path.realpath(custom_path)
+
+        # 2. Environment variable override
         env_path = os.environ.get(ENV_AUDIT_LOG_OVERRIDE)
         if env_path:
             return os.path.realpath(env_path)
-
-        # 2. Explicit constructor parameter
-        if custom_path:
-            return os.path.realpath(custom_path)
 
         # 3. Production mode if root
         if not force_user_mode and os.geteuid() == 0:
@@ -59,7 +78,8 @@ class AuditLogger:
             return str(fallback_dir / "audit.log")
         except OSError:
             tmp_dir = Path("/tmp/agent-root-runner")
-            tmp_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
+            if not _prepare_private_dir(tmp_dir):
+                raise
             return str(tmp_dir / "audit.log")
 
     def _ensure_file_open(self) -> None:
@@ -71,13 +91,19 @@ class AuditLogger:
             try:
                 os.makedirs(parent_dir, mode=0o700, exist_ok=True)
             except PermissionError:
-                # If cannot create /var/log/..., fall back to /tmp
-                tmp_dir = "/tmp/agent-root-runner"
-                os.makedirs(tmp_dir, mode=0o700, exist_ok=True)
-                self.log_path = os.path.join(tmp_dir, "audit.log")
+                # If we cannot create /var/log/..., fall back to a private dir we
+                # own. Refuse an unsafe pre-existing /tmp dir rather than logging
+                # into an attacker-controlled location.
+                tmp_dir = Path("/tmp/agent-root-runner")
+                if not _prepare_private_dir(tmp_dir):
+                    raise
+                self.log_path = str(tmp_dir / "audit.log")
 
-        flags = os.O_CREAT | os.O_APPEND | os.O_WRONLY
-        self._fd = os.open(self.log_path, flags, 0o600)
+        flags = os.O_CREAT | os.O_APPEND | os.O_WRONLY | getattr(os, "O_NOFOLLOW", 0)
+        try:
+            self._fd = os.open(self.log_path, flags, 0o600)
+        except OSError as exc:
+            raise RuntimeError(f"Cannot open audit log {self.log_path}: {exc}") from exc
 
         # Guarantee mode 0600
         try:

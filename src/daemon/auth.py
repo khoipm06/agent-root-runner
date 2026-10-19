@@ -106,16 +106,17 @@ def is_arm_authorized(
 ) -> bool:
     """Evaluates whether peer_uid is authorized to arm the runner.
 
-    In production: strictly requires peer_uid == 0.
-    In dev/test mode (allow_user_arm=True): permits root or the socket owner UID
-    (or current effective UID if not specified).
+    In production (allow_user_arm=False): strictly requires peer_uid == 0.
+
+    In development/test mode (allow_user_arm=True): any local peer that can
+    reach the socket is permitted, so a developer can arm the unprivileged
+    daemon they are running. This mode is refused for a root daemon (see
+    ``run_daemon_main``), so it can never grant a non-root user root arming.
     """
     if peer_uid == 0:
         return True
-    if allow_user_arm:
-        effective_owner = socket_owner_uid if socket_owner_uid is not None else os.geteuid()
-        if peer_uid == effective_owner or peer_uid >= 0:
-            return True
+    if allow_user_arm and peer_uid >= 0:
+        return True
     return False
 
 
@@ -127,10 +128,8 @@ def check_arm_permission(
     """Evaluates arm permission and returns a status tuple (allowed, reason)."""
     if creds.uid == 0:
         return True, "Root credentials verified."
-    if allow_user_arm:
-        effective_owner = socket_owner_uid if socket_owner_uid is not None else os.geteuid()
-        if creds.uid == effective_owner or creds.uid >= 0:
-            return True, "User arm permitted in development/test mode."
+    if allow_user_arm and creds.uid >= 0:
+        return True, "User arm permitted in development/test mode."
     return False, (
         f"Permission denied: Arming requires root privileges (peer_uid == 0, got {creds.uid}). "
         "Run 'sudo agent-root-runner arm' to enable."

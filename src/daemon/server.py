@@ -11,12 +11,14 @@ from __future__ import annotations
 import argparse
 import asyncio
 import json
+import math
 import os
 import signal
 import socket
 import stat
+import sys
 import time
-from typing import Any, Dict, Optional, Set
+from typing import Any, Dict, Optional, Set, Tuple
 
 from src.daemon.audit import AuditLogger
 from src.daemon.auth import PeerCredentials, get_peer_credentials
@@ -36,6 +38,7 @@ except ImportError:
 
 
 SYSTEM_SOCKET_PATH = "/run/agent-root-runner/runner.sock"
+MAX_TIMEOUT_SECONDS = 3600
 
 
 def resolve_socket_path(override_path: Optional[str] = None) -> str:
@@ -95,6 +98,8 @@ class AgentRootRunnerDaemon:
             max_output_bytes=self.max_buffer_limit,
             is_user_mode=allow_user_arm or (os.geteuid() != 0),
         )
+        # Kill any in-flight privileged command the moment we disarm.
+        self.state_machine.on_disarm = self.executor.terminate_current
         self._exec_semaphore = asyncio.Semaphore(1)
 
         self.server: Optional[asyncio.Server] = None
@@ -124,17 +129,19 @@ class AgentRootRunnerDaemon:
                     f"Active daemon already listening on {self.socket_path}"
                 )
             except (ConnectionRefusedError, FileNotFoundError):
+                # Stale socket: safe to remove.
                 probe.close()
                 try:
                     os.unlink(self.socket_path)
                 except OSError:
                     pass
-            except OSError:
+            except OSError as exc:
+                # e.g. EACCES/EPERM: the socket may be live but unreachable.
+                # Do not delete a socket we cannot prove is stale.
                 probe.close()
-                try:
-                    os.unlink(self.socket_path)
-                except OSError:
-                    pass
+                raise RuntimeError(
+                    f"Cannot verify existing socket {self.socket_path}: {exc}"
+                )
 
     def _apply_permissions(self) -> None:
         """Applies mode 0660 and attempts group ownership assignment."""
@@ -248,7 +255,7 @@ class AgentRootRunnerDaemon:
                         "id": None,
                         "error": {
                             "code": -32600,
-                            "message": "Line length exceeded buffer limit (10MB)",
+                            "message": f"Line length exceeded buffer limit ({self.max_buffer_limit} bytes)",
                         },
                     }
                     writer.write(json.dumps(err_resp).encode("utf-8") + b"\n")
@@ -424,10 +431,40 @@ class AgentRootRunnerDaemon:
         self, req_id: Any, params: Dict[str, Any], creds: PeerCredentials
     ) -> Dict[str, Any]:
         """Handles execution request including queueing, state re-check, guardrails, and execution."""
-        command = params.get("command") or params.get("cmd") or ""
-        timeout_seconds = params.get(
-            "timeout_seconds", params.get("timeout", 60)
-        )
+        raw_command = params.get("command", params.get("cmd", ""))
+        if not isinstance(raw_command, str):
+            return {
+                "jsonrpc": "2.0",
+                "id": req_id,
+                "error": {
+                    "code": -32602,
+                    "message": "Invalid params: 'command' must be a string",
+                    "data": {"reason": "INVALID_PARAMS"},
+                },
+            }
+        command = raw_command
+
+        raw_timeout = params.get("timeout_seconds", params.get("timeout", 60))
+        if raw_timeout is None:
+            raw_timeout = 60
+        if isinstance(raw_timeout, bool):
+            raw_timeout = None
+        try:
+            timeout_seconds = float(raw_timeout)
+        except (TypeError, ValueError):
+            timeout_seconds = -1.0
+        if not math.isfinite(timeout_seconds) or timeout_seconds <= 0:
+            return {
+                "jsonrpc": "2.0",
+                "id": req_id,
+                "error": {
+                    "code": -32602,
+                    "message": "Invalid params: 'timeout_seconds' must be a positive number",
+                    "data": {"reason": "INVALID_PARAMS"},
+                },
+            }
+        timeout_seconds = min(timeout_seconds, MAX_TIMEOUT_SECONDS)
+
         workdir = params.get("workdir", "/")
         env = params.get("env")
 
@@ -572,7 +609,11 @@ class AgentRootRunnerDaemon:
                     },
                 }
 
-            # 4. Subprocess Execution
+            # 4. Subprocess Execution. Bound the command to the remaining arm
+            # window so it cannot outlive its authorization.
+            remaining = await self.state_machine.remaining_seconds()
+            if remaining > 0:
+                timeout_seconds = min(timeout_seconds, remaining)
             try:
                 exec_res = await self.executor.execute(
                     command=command,
@@ -678,6 +719,13 @@ def run_daemon_main():
         help="Allow non-root arming in development/test mode",
     )
     args, _ = parser.parse_known_args()
+
+    if args.allow_user_arm and os.geteuid() == 0:
+        sys.exit(
+            "Error: --allow-user-arm is a development/test flag and is refused "
+            "for a root daemon (it would let any local user arm root execution). "
+            "Run the daemon as your own unprivileged user instead."
+        )
 
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
