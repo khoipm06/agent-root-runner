@@ -1337,4 +1337,82 @@ fn unprivileged_peer_cannot_arm_production_mode() {
     let r = call(&h.socket, "arm", json!({"duration_seconds":5})).unwrap();
     assert_eq!(r["error"]["code"], -32003);
     assert_eq!(r["error"]["data"]["reason"], "PERMISSION_DENIED");
+
+    // Spoofed peer_uid parameter in JSON payload must be ignored
+    let r_spoof = call(
+        &h.socket,
+        "arm",
+        json!({"duration_seconds":5, "peer_uid":0}),
+    )
+    .unwrap();
+    assert_eq!(r_spoof["error"]["code"], -32003);
+}
+
+#[test]
+fn daemon_restart_resets_state_to_disarmed() {
+    let dir = std::env::temp_dir().join(format!("arr-restart-test-{}", Uuid::new_v4()));
+    fs::create_dir_all(&dir).unwrap();
+    let socket = dir.join("runner.sock");
+    let audit = dir.join("audit.log");
+
+    // Start daemon 1 and arm --forever
+    let mut c1 = Command::new(BIN);
+    c1.arg("daemon")
+        .arg("--socket")
+        .arg(&socket)
+        .arg("--audit-log")
+        .arg(&audit)
+        .arg("--allow-user-arm")
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    let mut child1 = c1.spawn().unwrap();
+
+    let until = Instant::now() + Duration::from_secs(8);
+    while Instant::now() < until {
+        if socket.exists() && call(&socket, "ping", json!({})).is_ok() {
+            break;
+        }
+        thread::sleep(Duration::from_millis(20));
+    }
+
+    let arm_res = call(&socket, "arm", json!({"forever": true})).unwrap();
+    assert!(arm_res.get("error").is_none(), "arm failed: {arm_res}");
+    assert_eq!(arm_res["result"]["state"], "ARMED");
+    assert_eq!(arm_res["result"]["forever"], true);
+
+    // Terminate daemon 1
+    unsafe { libc::kill(child1.id() as i32, libc::SIGTERM) };
+    let _ = child1.wait();
+    let _ = fs::remove_file(&socket);
+
+    // Start daemon 2 on same socket and audit path
+    let mut c2 = Command::new(BIN);
+    c2.arg("daemon")
+        .arg("--socket")
+        .arg(&socket)
+        .arg("--audit-log")
+        .arg(&audit)
+        .arg("--allow-user-arm")
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    let mut child2 = c2.spawn().unwrap();
+
+    let until2 = Instant::now() + Duration::from_secs(8);
+    while Instant::now() < until2 {
+        if socket.exists() && call(&socket, "ping", json!({})).is_ok() {
+            break;
+        }
+        thread::sleep(Duration::from_millis(20));
+    }
+
+    let st = call(&socket, "status", json!({})).unwrap();
+    assert_eq!(
+        st["result"]["state"], "DISARMED",
+        "daemon restart must reset state to DISARMED"
+    );
+    assert_eq!(st["result"]["is_armed"], false);
+
+    unsafe { libc::kill(child2.id() as i32, libc::SIGTERM) };
+    let _ = child2.wait();
+    let _ = fs::remove_dir_all(dir);
 }

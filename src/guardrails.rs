@@ -127,7 +127,14 @@ pub fn evaluate_at(input: &str, cwd: &Path) -> Verdict {
     }
     let mut q = parse_chain_at(s, Some(cwd));
     let mut count = 0;
-    while !q.is_empty() && count < 512 {
+    while !q.is_empty() {
+        if count >= 512 {
+            return Verdict::block(
+                "RULE_RESOURCE_FORK_BOMB",
+                "resource",
+                "Command segment limit exceeded during analysis; execution prohibited",
+            );
+        }
         count += 1;
         let c = q.remove(0);
         if c.syntax {
@@ -5031,5 +5038,27 @@ mod tests {
         );
         assert!(protected("/dev/disk-test", &found, None));
         let _ = fs::remove_dir_all(tmp);
+    }
+
+    #[test]
+    fn segment_limit_exceeded_fails_closed() {
+        let mut chain = String::from("true");
+        for _ in 0..520 {
+            chain.push_str("; true");
+        }
+        let v = evaluate(&chain);
+        assert!(
+            !v.allowed,
+            "chains exceeding segment limit must not be allowed"
+        );
+        assert_eq!(v.rule, Some("RULE_RESOURCE_FORK_BOMB"));
+
+        let mut bypass_attempt = String::from("true");
+        for _ in 0..520 {
+            bypass_attempt.push_str("; true");
+        }
+        bypass_attempt.push_str("; rm -f /etc/shadow");
+        let v2 = evaluate(&bypass_attempt);
+        assert!(!v2.allowed, "payload after 512 segments must fail closed");
     }
 }
