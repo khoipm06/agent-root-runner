@@ -1,0 +1,32 @@
+name: Feature request
+description: Suggest an improvement with a clear problem and outcome.
+title: "[Feature]: "
+labels: [enhancement]
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: What problem should this solve?
+      description: Describe the situation and who is affected.
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Desired outcome
+      description: Explain what should happen, without prescribing an implementation unless necessary.
+    validations:
+      required: true
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives considered
+    validations:
+      required: false
+  - type: checkboxes
+    id: constraints
+    attributes:
+      label: Security and compatibility considerations
+      options:
+        - label: I considered how this affects the root privilege boundary and operator control.
+          required: false

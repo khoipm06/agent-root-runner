@@ -7,8 +7,8 @@
 <p align="center">
   <a href="#license"><img src="https://img.shields.io/badge/license-MIT-green.svg" alt="License MIT"/></a>
   <a href="#security-model"><img src="https://img.shields.io/badge/auth-SO__PEERCRED-blue.svg" alt="Auth SO_PEERCRED"/></a>
-  <a href="#automated-testing"><img src="https://img.shields.io/badge/tests-59%2F59%20passed%20(100%25)-brightgreen.svg" alt="Tests 100% Passed"/></a>
-  <a href="https://www.python.org/"><img src="https://img.shields.io/badge/python-3.10%2B-blue.svg" alt="Python 3.10+"/></a>
+  <a href="#automated-testing"><img src="https://img.shields.io/badge/tests-Rust%20unit%20%26%20integration-blue.svg" alt="Rust unit and integration tests"/></a>
+  <img src="https://img.shields.io/badge/runtime-native%20Rust-orange.svg" alt="Native Rust runtime"/>
 </p>
 
 ---
@@ -43,11 +43,11 @@ Operator (Human Admin)
 | AI Agent Harnesses                                                      |
 |   - Antigravity (agy)        - OpenCode (opencode)       - Pi (pi)      |
 |                                                                         |
-| Stdio MCP (agent-root-mcp) / CLI Wrapper (agent-root-exec)              |
+| Stdio MCP / CLI Wrapper (`agent-root-runner mcp|exec`)                   |
 +------------------------------+------------------------------------------+
                                v
 +-------------------------------------------------------------------------+
-| Root Daemon (agent-root-runner-daemon)                                  |
+| Root Daemon (`agent-root-runner daemon`)                                 |
 |   1. In-Memory State Machine  -> Check ARMED / Quota / Timeout          |
 |   2. Universal Guardrails     -> Evaluate OS destabilization rules      |
 |   3. Subprocess Executor      -> Isolated process group + RLIMIT caps   |
@@ -57,11 +57,11 @@ Operator (Human Admin)
                       Privileged Subprocess (UID 0)
 ```
 
-- **Root Daemon** (`src/daemon/server.py`): Systemd service running as root, owning the Unix domain socket.
-- **Kernel-Verified Identity** (`src/daemon/auth.py`): Uses `SO_PEERCRED` to inspect the peer process UID, GID, and PID directly from the kernel. Non-root users cannot arm the service.
-- **In-Memory State Machine** (`src/daemon/state.py`): The `ARMED` state exists only in memory; restarts immediately reset the daemon to `DISARMED`.
-- **Universal Guardrails** (`src/guardrails/analyzer.py`): Pre-execution AST and stream inspection designed to catch OS destabilization universally across storage layouts and Linux distributions.
-- **Subprocess Isolation** (`src/daemon/executor.py`): Executes commands in new process groups (`setpgid`) with resource limits (`RLIMIT`) and signal-tree cleanup.
+- **Single Native Executable**: One Rust ELF provides management, daemon, `exec`, and stdio MCP subcommands; installed services and harnesses need no secondary runtime.
+- **Kernel-Verified Identity**: The daemon reads Linux `SO_PEERCRED` credentials (UID, GID, PID) directly from the kernel. Non-root users cannot ARM the service.
+- **Volatile State Machine**: `ARMED` state exists only in memory; daemon restarts immediately reset it to `DISARMED`.
+- **Universal Guardrails**: Pre-execution shell parsing and OS-destabilization rules inspect storage, auth, boot, linker, persistence, process, network, and mount changes.
+- **Subprocess Isolation**: Commands execute in new process groups with resource limits and process-tree cleanup.
 
 ---
 
@@ -69,19 +69,18 @@ Operator (Human Admin)
 
 ### 1. Install
 
-A single command installs everything: it places the four CLI entry points on
-`/usr/local/bin`, installs the systemd unit, enables the service, and starts and
-verifies it.
+A single executable installs the service, enables it, and starts and verifies it.
 
 **From a source checkout:**
 
 ```bash
 git clone https://github.com/khoipm06/agent-root-runner.git
 cd agent-root-runner
-sudo ./bin/agent-root-runner install
+cargo build --release
+sudo ./target/release/agent-root-runner install
 ```
 
-**Or from a prebuilt release** (standalone binaries, no Python toolchain needed):
+**Or from a prebuilt release** (standalone native executable):
 
 ```bash
 curl -LO https://github.com/khoipm06/agent-root-runner/releases/latest/download/agent-root-runner-linux-x86_64.tar.gz
@@ -116,10 +115,8 @@ Daemon is disarmed. Run 'agent-root-runner arm' to enable.
 sudo agent-root-runner uninstall
 ```
 
-> **Note:** The standalone binaries are PyInstaller one-file executables that
-> unpack into `$TMPDIR` at runtime. On systems where `/tmp` (or `$TMPDIR`) is
-> mounted `noexec`, set `TMPDIR` to an executable filesystem (or use a source
-> install) before running them.
+The release is one native ELF executable; the Plasma applet is published as a
+separate archive. The executable requires no runtime extraction.
 
 ---
 
@@ -141,9 +138,9 @@ sudo agent-root-runner uninstall
    sudo agent-root-runner arm --forever --quota 25
    ```
 
-2. **Agent Execution**: The agent calls `agent-root-exec` or the MCP tool `run_privileged_command`:
+2. **Agent Execution**: The agent calls the `exec` subcommand or the MCP tool `run_privileged_command`:
    ```bash
-   agent-root-exec -- <command...>
+   agent-root-runner exec -- <command...>
    ```
 
 3. **Disarm**: The daemon automatically locks when `--duration` expires or `--quota` is exhausted. The operator may disarm immediately at any time:
@@ -193,12 +190,15 @@ Management CLI:
 | `agent-root-runner [--socket PATH] arm` | `--forever` | ARM without a time deadline; mutually exclusive with `--duration`. Manual disarm, quota exhaustion, or daemon restart ends the session. |
 | `agent-root-runner install` | — | Install/enable/start the systemd daemon service. Requires administrator authorization. |
 | `agent-root-runner uninstall` | — | Remove the systemd service installation. Requires administrator authorization. |
+| `agent-root-runner daemon` | `--audit-log PATH`, `--allow-user-arm` | Start the native Unix-socket daemon (normally systemd-managed). |
+| `agent-root-runner exec` | `--timeout`, `--workdir`, `--socket`, repeated `--env KEY=VALUE`, `-- COMMAND...` | Request guarded privileged execution. |
+| `agent-root-runner mcp` | `--socket` | Run stdio MCP server for harness integration. |
 
 On a desktop with Polkit, prefix administrative CLI operations with
 `pkexec` (for example, `pkexec agent-root-runner arm --duration 300`). On other
 systems use the configured administrator mechanism, such as `sudo`.
 
-Privileged execution wrapper:
+Privileged execution (`exec` subcommand):
 
 | Option | Default | Behavior |
 |---|---|---|
@@ -211,10 +211,10 @@ Privileged execution wrapper:
 For example, after ARM:
 
 ```bash
-agent-root-exec --timeout 30 --workdir / --env LANG=C -- id -u
+agent-root-runner exec --timeout 30 --workdir / --env EDITOR=vi -- id -u
 ```
 
-Daemon-only options (normally supplied by systemd):
+Daemon options (normally supplied by systemd):
 
 | Option | Default | Behavior |
 |---|---|---|
@@ -222,8 +222,8 @@ Daemon-only options (normally supplied by systemd):
 | `--audit-log PATH` | `/var/log/agent-root-runner/audit.log` | Append-only audit log path. |
 | `--allow-user-arm` | Disabled | Development/test mode only; rejected when the daemon runs as root. |
 
-Run each installed command with `--help` for its parser's help text. The MCP
-server `agent-root-mcp [--socket PATH]` exposes `run_privileged_command` with
+Run `agent-root-runner <subcommand> --help` for help. The MCP server
+`agent-root-runner mcp [--socket PATH]` exposes `run_privileged_command` with
 `command` (required), `workdir` (default `/`), `timeout` (default `60`, range
 `1..3600`), and `env` (default `{}`, string values). MCP tools execute commands but cannot ARM the daemon;
 the operator must ARM first.
@@ -232,18 +232,19 @@ the operator must ARM first.
 
 ## Agent Harness Integration (MCP Server)
 
-All supported harnesses connect via the stdio MCP binary `/usr/local/bin/agent-root-mcp`.
+All supported harnesses connect to the stdio MCP subcommand of
+`/usr/local/bin/agent-root-runner`.
 
 ### Registration via Native CLI
 
-The `agent-root-mcp` entry point is already on `PATH` after
-`agent-root-runner install`. Register it with your harness's official CLI:
+The `agent-root-runner` executable is on `PATH` after install. Register the
+`mcp` subcommand with your harness's official CLI:
 
 | Harness | Registration Command | Scope / Notes |
 |---|---|---|
-| **Antigravity (`agy`)** | `agy mcp add agent-root-runner /usr/local/bin/agent-root-mcp` | Adds to global Antigravity MCP settings |
-| **OpenCode (`opencode`)** | `opencode mcp add --global agent-root-runner -- /usr/local/bin/agent-root-mcp` | `--global` configures across all projects |
-| **Pi Coding Agent (`pi`)** | `pi mcp add agent-root-runner --exposure direct -- /usr/local/bin/agent-root-mcp` | Adds to `~/.pi/agent/mcp.json` and exposes the tool directly to the model |
+| **Antigravity (`agy`)** | `agy mcp add agent-root-runner /usr/local/bin/agent-root-runner mcp` | Adds to global Antigravity MCP settings |
+| **OpenCode (`opencode`)** | `opencode mcp add --global agent-root-runner -- /usr/local/bin/agent-root-runner mcp` | `--global` configures across all projects |
+| **Pi Coding Agent (`pi`)** | `pi mcp add agent-root-runner --exposure direct -- /usr/local/bin/agent-root-runner mcp` | Adds to `~/.pi/agent/mcp.json` and exposes the tool directly to the model |
 
 ### MCP Tool Schema
 
@@ -262,6 +263,16 @@ The agent gains access to the tool **`run_privileged_command`**:
 
 The guardrails inspect commands to block actions that render the underlying operating system unusable. They resolve storage topologies, device classes, and critical mount hierarchies dynamically to ensure universal protection across any Linux machine.
 
+Static analysis is deliberately fail-closed where it cannot determine filesystem
+effects: unsupported brace-group, function, or subshell syntax; opaque
+interpreter and uninspectable shebang-script execution; shell-script/source
+invocations; `env -S` command strings; shell startup hooks and interactive
+startup options; unresolved relative mutations; uncertain `find` actions; and chained
+filesystem writes after commands that may create or move path aliases
+(including `mv --exchange`) are rejected. Simple shell shebang scripts are
+analyzed conservatively; interpreter version/help queries remain available.
+Archive extraction is denied when member destinations cannot be verified.
+
 | Rule Identifier | Description & Scope |
 |---|---|
 | `RULE_PIPELINE_XARGS_DATAFLOW` | Pipeline dataflow inspection blocking stream-fed mutating commands directed at core system paths. |
@@ -275,13 +286,16 @@ The guardrails inspect commands to block actions that render the underlying oper
 | `RULE_RECURSIVE_PERM_CHANGE` | Protection against stripping execution permissions from system roots or essential system binaries. |
 | `RULE_PERSISTENCE_TAMPER` | Protection against wiping system crontabs and truncating sensitive system audit logs. |
 | `RULE_RESOURCE_FORK_BOMB` | Static analysis blocking recursive shell fork bomb definitions. |
+| `RULE_EVASION_SYNTAX_ERROR` | Unsupported or malformed shell syntax that prevents reliable command analysis. |
+| `RULE_EVASION_INTERPRETER_CODE` | Opaque interpreter, shebang-script, shell startup, shell-script/source, or `env -S` execution whose filesystem effects cannot be statically analyzed. |
+| `RULE_EVASION_UNRESOLVED_VAR` | Unresolved paths, unverified archive member destinations, or chained filesystem mutations whose target cannot be safely established. |
 | `RULE_NETWORK_ISOLATION` | Protection against unmitigated firewall rule flushes and stopping primary network management daemons. |
 
 ---
 
 ## Exit Codes & Error Reference
 
-`agent-root-exec` maps daemon responses into standard POSIX-compliant exit codes:
+`agent-root-runner exec` maps daemon responses into standard POSIX-compliant exit codes:
 
 | Exit Code | Semantics | JSON-RPC Code | Root Cause & Resolution |
 |:---:|---|:---:|---|
@@ -295,7 +309,7 @@ The guardrails inspect commands to block actions that render the underlying oper
 A command that executes successfully passes its **own** exit status straight
 through (`0`–`255`). The codes above are emitted by the wrapper for *daemon-level*
 conditions, so a command that itself exits `124`/`125`/`126` is indistinguishable
-from a wrapper signal — check stderr for the `agent-root-exec:` prefix to tell
+from a wrapper signal — check stderr for the `agent-root-runner exec:` prefix to tell
 them apart.
 
 ---
@@ -306,11 +320,11 @@ them apart.
 - **Socket Permissions**: `/run/agent-root-runner/` is created with mode `0750` (owned by `root:wheel`), and `runner.sock` with mode `0660`. Non-root clients must be members of the `wheel` group.
 - **Append-Only Audit Log**: Stored at `/var/log/agent-root-runner/audit.log` (mode `0600`), synced with `fdatasync`.
 - **Fail-Closed Disarm**: Every arm session is bounded by a dual-tier timer and an optional command quota. When the window closes — timeout, quota exhaustion, or a manual `disarm` — any privileged command still running is **SIGKILLed** so it cannot outlive its authorization.
-- **Development Mode**: `agent-root-runner-daemon --allow-user-arm` lets any local socket user arm. It is **refused when the daemon runs as root**, so it can never grant a non-root user root execution; run the daemon as your own unprivileged user for local development.
+- **Development Mode**: `agent-root-runner daemon --allow-user-arm` lets any local socket user arm. It is **refused when the daemon runs as root**, so it can never grant a non-root user root execution; run the daemon as your own unprivileged user for local development.
 
 ```bash
 # View recent audit decisions
-sudo tail -20 /var/log/agent-root-runner/audit.log | python3 -m json.tool --json-lines
+sudo tail -20 /var/log/agent-root-runner/audit.log | jq -c .
 
 # Find all commands blocked by guardrails
 sudo grep "GUARDRAIL_BLOCKED" /var/log/agent-root-runner/audit.log
@@ -320,14 +334,12 @@ sudo grep "GUARDRAIL_BLOCKED" /var/log/agent-root-runner/audit.log
 
 ## Automated Testing
 
-The repository includes a comprehensive 4-tier automated test suite requiring no sudo password prompts. The E2E tiers spawn the **real** `src.daemon.server` process (unprivileged, with `--allow-user-arm`), so they exercise the production state machine, guardrail analyzer, executor, and audit logger end-to-end.
+The repository's native Rust unit and integration tests exercise guardrail
+vectors, daemon IPC, execution boundaries, and the release executable.
 
 ```bash
-# Run all 4 E2E tiers (59 tests)
-./tests/test_runner.sh
-
-# Run full unit and adversarial test suites (270 tests)
-python3 -m unittest discover -s tests -t .
+# Native unit and integration tests
+cargo test --locked --all-targets
 ```
 
 ---

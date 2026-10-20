@@ -1,4 +1,4 @@
-name: CI & Binary Build
+name: CI & Native Release Build
 
 on:
   push:
@@ -9,89 +9,85 @@ on:
   workflow_dispatch:
 
 permissions:
-  contents: write
+  contents: read
 
 jobs:
   test:
-    name: Test (Python ${{ matrix.python-version }})
+    name: Native and behavioral tests
     runs-on: ubuntu-24.04
-    strategy:
-      fail-fast: false
-      matrix:
-        python-version: ["3.10", "3.11", "3.12", "3.13"]
-
+    permissions:
+      contents: read
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
-
-      - name: Set up Python ${{ matrix.python-version }}
-        uses: actions/setup-python@v5
         with:
-          python-version: ${{ matrix.python-version }}
+          persist-credentials: false
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+      - name: Run native unit and integration tests
+        run: cargo test --locked --all-targets
 
-      - name: Run Unit Tests
-        run: python -m unittest discover -s tests -t .
-
-      - name: Run E2E Integration Suite
-        run: bash ./tests/test_runner.sh
-
-  build-binaries:
-    name: Build Standalone Binaries (Linux x86_64)
+  build-release:
+    name: Build single native executable (Linux x86_64)
     needs: test
     runs-on: ubuntu-24.04
-
+    permissions:
+      contents: read
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
-
-      - name: Set up Python 3.12
-        uses: actions/setup-python@v5
         with:
-          python-version: "3.12"
-
-      - name: Install PyInstaller
-        run: pip install --upgrade pyinstaller
-
-      - name: Build Standalone Binaries
+          persist-credentials: false
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@stable
+      - name: Build release executable
+        run: cargo build --locked --release
+      - name: Verify ELF and subcommands
+        run: |
+          file target/release/agent-root-runner | grep -q ELF
+          target/release/agent-root-runner --help
+          target/release/agent-root-runner daemon --help
+          target/release/agent-root-runner exec --help
+          target/release/agent-root-runner mcp --help
+          ! ldd target/release/agent-root-runner | grep -i python
+      - name: Smoke-test release executable
+        run: cargo test --locked --release --test release_runtime
+      - name: Package release executable and Plasma applet
         run: |
           mkdir -p dist
-          pyinstaller --onefile --clean --paths . --add-data "systemd/agent-root-runner.service:systemd" bin/agent-root-runner -n agent-root-runner --distpath dist
-          pyinstaller --onefile --clean --paths . bin/agent-root-runner-daemon -n agent-root-runner-daemon --distpath dist
-          pyinstaller --onefile --clean --paths . bin/agent-root-exec -n agent-root-exec --distpath dist
-          pyinstaller --onefile --clean --paths . bin/agent-root-mcp -n agent-root-mcp --distpath dist
-
-      - name: Verify Binaries
-        run: |
-          ./dist/agent-root-runner --help
-          ./dist/agent-root-runner-daemon --help
-          ./dist/agent-root-exec --help
-          ./dist/agent-root-mcp --help
-
-      - name: Archive Binaries Tarball
-        run: |
-          tar -czf dist/agent-root-runner-linux-x86_64.tar.gz -C dist agent-root-runner agent-root-runner-daemon agent-root-exec agent-root-mcp
+          install -m 0755 target/release/agent-root-runner dist/agent-root-runner
+          tar -czf dist/agent-root-runner-linux-x86_64.tar.gz -C dist agent-root-runner
           (cd plasma-applet && zip -qr ../dist/agent-root-runner-plasma-applet.zip metadata.json contents)
-
-      - name: Upload Artifacts
+      - name: Upload artifacts
         uses: actions/upload-artifact@v4
         with:
           name: agent-root-runner-linux-x86_64
           path: |
             dist/agent-root-runner
-            dist/agent-root-runner-daemon
-            dist/agent-root-exec
-            dist/agent-root-mcp
             dist/agent-root-runner-linux-x86_64.tar.gz
             dist/agent-root-runner-plasma-applet.zip
 
+  publish-release:
+    name: Publish tagged release
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: build-release
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - name: Download release artifacts
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: agent-root-runner-linux-x86_64
+          path: dist
       - name: Create Release
-        if: startsWith(github.ref, 'refs/tags/v')
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2.6.2
         with:
           files: |
             dist/agent-root-runner-linux-x86_64.tar.gz
             dist/agent-root-runner-plasma-applet.zip
             dist/agent-root-runner
-            dist/agent-root-runner-daemon
-            dist/agent-root-exec
-            dist/agent-root-mcp

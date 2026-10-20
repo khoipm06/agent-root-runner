@@ -1,0 +1,1515 @@
+mod audit;
+mod executor;
+mod guardrails;
+mod state;
+
+use audit::{AuditLogger, object};
+use clap::{Args, Parser, Subcommand};
+use executor::Executor;
+use serde_json::{Map, Value, json};
+use signal_hook::{
+    consts::{SIGINT, SIGTERM},
+    flag,
+};
+use state::StateMachine;
+use std::fs::{self, OpenOptions};
+use std::io::{self, BufRead, BufReader, Read, Write};
+use std::os::fd::AsRawFd;
+use std::os::unix::fs::{FileTypeExt, MetadataExt, OpenOptionsExt, PermissionsExt};
+use std::os::unix::net::{UnixListener, UnixStream};
+use std::path::{Path, PathBuf};
+use std::process::{Command, ExitCode};
+use std::sync::{
+    Arc, Mutex,
+    atomic::{AtomicBool, AtomicI32, Ordering},
+};
+use std::thread;
+use std::time::{Duration, Instant};
+
+const VERSION: &str = env!("CARGO_PKG_VERSION");
+const DEFAULT_SOCKET: &str = "/run/agent-root-runner/runner.sock";
+const MAX_BUFFER: usize = 10 * 1024 * 1024;
+// A valid result can contain two 10 MiB streams, with JSON escaping expanding
+// control bytes by up to 6x. Bound client-side response reads accordingly.
+const MAX_RESPONSE: usize = 128 * 1024 * 1024;
+const MAX_COMMAND: usize = 65_536;
+const UNIT_TEXT: &str = include_str!("../systemd/agent-root-runner.service");
+
+#[derive(Parser)]
+#[command(
+    name = "agent-root-runner",
+    version,
+    about = "Native privileged command runner with human-in-the-loop arming"
+)]
+struct Cli {
+    #[arg(long, global = true, help = "Override the daemon Unix socket path")]
+    socket: Option<PathBuf>,
+    #[command(subcommand)]
+    command: Commands,
+}
+#[derive(Subcommand)]
+enum Commands {
+    Status,
+    Arm {
+        #[arg(
+            long,
+            conflicts_with = "forever",
+            help = "Arming duration in seconds (default: 900; maximum: 86400)"
+        )]
+        duration: Option<u64>,
+        #[arg(
+            long,
+            conflicts_with = "duration",
+            help = "Arm without a time limit; manual disarm, quota exhaustion, or daemon restart ends the session"
+        )]
+        forever: bool,
+        #[arg(long, help = "Maximum admitted commands before automatic disarm")]
+        quota: Option<u64>,
+    },
+    Disarm,
+    Install,
+    Uninstall,
+    Daemon {
+        #[arg(long, help = "Append-only audit log path")]
+        audit_log: Option<PathBuf>,
+        #[arg(
+            long,
+            help = "Development/test-only: allow local users to arm an unprivileged daemon"
+        )]
+        allow_user_arm: bool,
+    },
+    Exec(ExecArgs),
+    Mcp,
+}
+#[derive(Args)]
+struct ExecArgs {
+    #[arg(
+        long,
+        default_value_t = 60,
+        help = "Execution timeout in seconds (1..3600)"
+    )]
+    timeout: u64,
+    #[arg(long, default_value = "/", help = "Working directory")]
+    workdir: String,
+    #[arg(long="env",action=clap::ArgAction::Append,help="Additional environment variable KEY=VALUE (repeatable)")]
+    env: Vec<String>,
+    #[arg(last=true,required=true,num_args=1..,allow_hyphen_values=true)]
+    command: Vec<String>,
+}
+
+fn main() -> ExitCode {
+    match run() {
+        Ok(code) => ExitCode::from(code.clamp(0, 255) as u8),
+        Err(e) => {
+            eprintln!("agent-root-runner: {e}");
+            ExitCode::from(1)
+        }
+    }
+}
+fn run() -> Result<i32, String> {
+    let cli = Cli::parse();
+    match cli.command {
+        Commands::Status => management(cli.socket.as_deref(), "status", Map::new()),
+        Commands::Arm {
+            duration,
+            forever,
+            quota,
+        } => {
+            let mut p = Map::new();
+            p.insert("forever".into(), json!(forever));
+            if !forever {
+                p.insert("duration_seconds".into(), json!(duration.unwrap_or(900)));
+            }
+            if let Some(q) = quota {
+                p.insert("quota".into(), json!(q));
+            }
+            management(cli.socket.as_deref(), "arm", p)
+        }
+        Commands::Disarm => management(cli.socket.as_deref(), "disarm", Map::new()),
+        Commands::Install => install(),
+        Commands::Uninstall => uninstall(),
+        Commands::Daemon {
+            audit_log,
+            allow_user_arm,
+        } => daemon(
+            resolve_socket(cli.socket.as_deref()),
+            audit_log.as_deref(),
+            allow_user_arm,
+        ),
+        Commands::Exec(args) => exec_cli(cli.socket.as_deref(), args),
+        Commands::Mcp => mcp(cli.socket.as_deref()),
+    }
+}
+
+fn resolve_socket(override_path: Option<&Path>) -> PathBuf {
+    if let Some(p) = override_path {
+        return absolute(p);
+    }
+    if let Ok(p) = std::env::var("AGENT_ROOT_RUNNER_SOCKET") {
+        return absolute(Path::new(&p));
+    }
+    if unsafe { libc::geteuid() } == 0 {
+        return PathBuf::from(DEFAULT_SOCKET);
+    }
+    let sys = Path::new(DEFAULT_SOCKET);
+    if sys.exists() {
+        return sys.into();
+    }
+    if let Ok(x) = std::env::var("XDG_RUNTIME_DIR") {
+        return PathBuf::from(x).join("agent-root-runner/runner.sock");
+    }
+    std::env::var_os("HOME")
+        .map(|h| PathBuf::from(h).join(".local/state/agent-root-runner/runner.sock"))
+        .unwrap_or_else(|| PathBuf::from("/tmp/agent-root-runner/runner.sock"))
+}
+fn absolute(path: &Path) -> PathBuf {
+    if path.is_absolute() {
+        path.into()
+    } else {
+        std::env::current_dir().unwrap_or_default().join(path)
+    }
+}
+fn rpc(
+    socket: &Path,
+    method: &str,
+    params: Map<String, Value>,
+    timeout: Duration,
+) -> Result<Value, String> {
+    let mut s = UnixStream::connect(socket).map_err(|e| {
+        format!(
+            "Cannot connect to daemon at {}. Is it running? ({e})",
+            socket.display()
+        )
+    })?;
+    s.set_read_timeout(Some(timeout))
+        .map_err(|e| e.to_string())?;
+    s.set_write_timeout(Some(timeout))
+        .map_err(|e| e.to_string())?;
+    let req = json!({"jsonrpc":"2.0","id":1,"method":method,"params":params});
+    writeln!(s, "{req}").map_err(|e| format!("Daemon communication failed: {e}"))?;
+    let mut line = Vec::new();
+    BufReader::new(s)
+        .take((MAX_RESPONSE + 1) as u64)
+        .read_until(b'\n', &mut line)
+        .map_err(|e| e.to_string())?;
+    if line.is_empty() {
+        return Err("Daemon closed connection unexpectedly.".into());
+    }
+    if line.len() > MAX_RESPONSE {
+        return Err("Response exceeded maximum output buffer limit".into());
+    }
+    serde_json::from_slice(&line).map_err(|e| format!("Malformed response from daemon: {e}"))
+}
+fn management(
+    path: Option<&Path>,
+    method: &str,
+    params: Map<String, Value>,
+) -> Result<i32, String> {
+    let socket = resolve_socket(path);
+    let resp = rpc(&socket, method, params, Duration::from_secs(10))?;
+    if let Some(err) = resp.get("error") {
+        let msg = err["message"].as_str().unwrap_or("Unknown daemon error");
+        eprintln!(
+            "Error: {msg}{}",
+            if err["code"] == -32003 {
+                " (run with sudo)"
+            } else {
+                ""
+            }
+        );
+        return Ok(match err["code"].as_i64().unwrap_or(-32603) {
+            -32001 => 125,
+            -32002 => 126,
+            -32003 => 1,
+            -32004 => 124,
+            _ => 128,
+        });
+    }
+    let result = resp.get("result").cloned().unwrap_or_else(|| json!({}));
+    match method {
+        "status" => {
+            println!("State: {}", result["state"].as_str().unwrap_or("UNKNOWN"));
+            println!(
+                "Armed: {}",
+                py_bool(result["is_armed"].as_bool().unwrap_or(false))
+            );
+            for (label, key) in [
+                ("Session", "session_id"),
+                ("Armed at", "armed_at"),
+                ("Expires at", "expires_at"),
+                ("Remaining", "remaining_seconds"),
+                ("Timeout", "timeout_seconds"),
+                ("Duration", "duration_seconds"),
+                ("Forever", "forever"),
+                ("Quota limit", "quota_limit"),
+                ("Quota remaining", "quota_remaining"),
+                ("Commands executed", "commands_executed"),
+                ("Lifetime commands", "lifetime_commands"),
+                ("Socket", "socket_path"),
+                ("Daemon PID", "daemon_pid"),
+            ] {
+                if !result[key].is_null() {
+                    let val = if key == "forever" {
+                        py_bool(result[key].as_bool().unwrap_or(false)).to_string()
+                    } else {
+                        format_value(&result[key])
+                    };
+                    println!("{label}: {val}")
+                }
+            }
+            if result["state"] == "DISARMED" {
+                println!("Daemon is disarmed. Run 'agent-root-runner arm' to enable.")
+            } else if result["forever"].as_bool() == Some(true) {
+                println!(
+                    "ARM has no time limit; disarm manually, exhaust quota, or restart the daemon."
+                )
+            }
+        }
+        "arm" => {
+            println!(
+                "Armed: {}",
+                py_bool(result["is_armed"].as_bool().unwrap_or(false))
+            );
+            if let Some(x) = result["expires_at"].as_str() {
+                println!("Expires at: {x}")
+            } else if result["forever"].as_bool() == Some(true) {
+                println!("Expires: Never (manual disarm, quota exhaustion, or daemon restart)")
+            }
+            if let Some(q) = result["quota"].as_u64() {
+                println!("Quota: {q} commands")
+            }
+        }
+        "disarm" => println!("Disarmed."),
+        _ => (),
+    };
+    Ok(0)
+}
+fn py_bool(b: bool) -> &'static str {
+    if b { "True" } else { "False" }
+}
+fn format_value(v: &Value) -> String {
+    match v {
+        Value::String(s) => s.clone(),
+        _ => v.to_string(),
+    }
+}
+
+fn exec_cli(path: Option<&Path>, args: ExecArgs) -> Result<i32, String> {
+    if !(1..=3600).contains(&args.timeout) {
+        return Err("--timeout must be in range 1..3600".into());
+    }
+    let command = args.command.join(" ");
+    let mut env = Map::new();
+    for item in args.env {
+        if let Some((k, v)) = item.split_once('=') {
+            env.insert(k.into(), json!(v));
+        } else {
+            return Err(format!("--env must be KEY=VALUE: {item}"));
+        }
+    }
+    let mut p = Map::new();
+    p.insert("command".into(), json!(command));
+    p.insert("timeout_seconds".into(), json!(args.timeout));
+    p.insert("workdir".into(), json!(args.workdir));
+    p.insert("env".into(), Value::Object(env));
+    let response = rpc(
+        &resolve_socket(path),
+        "exec",
+        p,
+        Duration::from_secs(args.timeout + 10),
+    )?;
+    if let Some(err) = response.get("error") {
+        eprintln!(
+            "agent-root-runner exec: {}",
+            err["message"].as_str().unwrap_or("daemon error")
+        );
+        return Ok(match err["code"].as_i64().unwrap_or(-32603) {
+            -32001 => 125,
+            -32002 => 126,
+            -32003 => 1,
+            -32004 => 124,
+            _ => 128,
+        });
+    }
+    let res = &response["result"];
+    let out = res["stdout"].as_str().unwrap_or("");
+    let err = res["stderr"].as_str().unwrap_or("");
+    if !out.is_empty() {
+        print!("{out}");
+        if !out.ends_with('\n') {
+            println!()
+        }
+    }
+    if !err.is_empty() {
+        eprint!("{err}");
+        if !err.ends_with('\n') {
+            eprintln!()
+        }
+    }
+    Ok(res["exit_code"]
+        .as_i64()
+        .filter(|n| (0..=255).contains(n))
+        .unwrap_or(128) as i32)
+}
+
+#[derive(Clone)]
+struct Peer {
+    pid: i32,
+    uid: u32,
+    gid: u32,
+    comm: String,
+}
+struct Daemon {
+    socket: PathBuf,
+    started: Instant,
+    state: Arc<StateMachine>,
+    executor: Arc<Executor>,
+    exec_lock: Arc<Mutex<()>>,
+}
+fn daemon(socket: PathBuf, audit_path: Option<&Path>, allow_user_arm: bool) -> Result<i32, String> {
+    let euid = unsafe { libc::geteuid() };
+    if allow_user_arm && euid == 0 {
+        return Err("--allow-user-arm is refused for a root daemon; run it unprivileged for local development".into());
+    }
+    executor::enable_child_subreaper()
+        .map_err(|e| format!("Cannot enable descendant cleanup (child subreaper): {e}"))?;
+    let audit = Arc::new(AuditLogger::open(
+        audit_path.map(|p| p.to_string_lossy()).as_deref(),
+        allow_user_arm || euid != 0,
+    )?);
+    prepare_socket(&socket)?;
+    let listener = bind_socket(&socket)?;
+    listener.set_nonblocking(true).map_err(|e| e.to_string())?;
+    let active = Arc::new(AtomicI32::new(0));
+    let state = Arc::new(StateMachine::new(
+        audit.clone(),
+        active.clone(),
+        allow_user_arm,
+    ));
+    let executor = Arc::new(Executor::new(
+        active,
+        state.clone(),
+        allow_user_arm || euid != 0,
+    ));
+    let app = Arc::new(Daemon {
+        socket: socket.clone(),
+        started: Instant::now(),
+        state: state.clone(),
+        executor,
+        exec_lock: Arc::new(Mutex::new(())),
+    });
+    audit
+        .event(
+            "DAEMON_START",
+            None,
+            None,
+            None,
+            None,
+            object(&[
+                ("socket_path", json!(socket.to_string_lossy())),
+                ("pid", json!(std::process::id())),
+                ("allow_user_arm", json!(allow_user_arm)),
+            ]),
+        )
+        .map_err(|e| format!("Cannot audit daemon start: {e}"))?;
+    let stop = Arc::new(AtomicBool::new(false));
+    flag::register(SIGTERM, stop.clone()).map_err(|e| e.to_string())?;
+    flag::register(SIGINT, stop.clone()).map_err(|e| e.to_string())?;
+    let mut loop_error = None;
+    while !stop.load(Ordering::SeqCst) {
+        if let Err(error) = state.check_expiry() {
+            loop_error = Some(error);
+            break;
+        }
+        match listener.accept() {
+            Ok((stream, _)) => {
+                let app = app.clone();
+                thread::spawn(move || {
+                    let _ = app.client(stream);
+                });
+            }
+            Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
+                thread::sleep(Duration::from_millis(25))
+            }
+            Err(e) => {
+                let shutdown = state.shutdown();
+                let _ = fs::remove_file(&socket);
+                return match shutdown {
+                    Ok(()) => Err(format!("Socket accept failed: {e}")),
+                    Err(audit_error) => Err(format!(
+                        "Socket accept failed: {e}; shutdown audit failed: {audit_error}"
+                    )),
+                };
+            }
+        }
+    }
+    let shutdown = state.shutdown();
+    let _ = fs::remove_file(&socket);
+    if let Some(error) = loop_error {
+        return Err(error);
+    }
+    shutdown?;
+    Ok(0)
+}
+fn prepare_socket(path: &Path) -> Result<(), String> {
+    let parent = path.parent().ok_or("socket path has no parent directory")?;
+    prepare_socket_parent(parent, unsafe { libc::geteuid() } == 0)?;
+    match fs::symlink_metadata(path) {
+        Ok(md) => {
+            if !md.file_type().is_socket() {
+                return Err(format!(
+                    "Path {} exists and is not a socket file.",
+                    path.display()
+                ));
+            }
+            match UnixStream::connect(path) {
+                Ok(_) => {
+                    return Err(format!(
+                        "Active daemon already listening on {}",
+                        path.display()
+                    ));
+                }
+                Err(e)
+                    if matches!(
+                        e.raw_os_error(),
+                        Some(libc::ECONNREFUSED) | Some(libc::ENOENT)
+                    ) =>
+                {
+                    fs::remove_file(path).map_err(|e| {
+                        format!("Cannot remove stale socket {}: {e}", path.display())
+                    })?
+                }
+                Err(e) => {
+                    return Err(format!(
+                        "Cannot verify existing socket {}: {e}",
+                        path.display()
+                    ));
+                }
+            }
+        }
+        Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+        Err(e) => {
+            return Err(format!(
+                "Cannot inspect socket path {}: {e}",
+                path.display()
+            ));
+        }
+    }
+    Ok(())
+}
+fn bind_socket(path: &Path) -> Result<UnixListener, String> {
+    let umask = UmaskGuard::set(0o117);
+    let listener =
+        UnixListener::bind(path).map_err(|e| format!("Cannot bind {}: {e}", path.display()))?;
+    drop(umask);
+    Ok(listener)
+}
+struct UmaskGuard(libc::mode_t);
+impl UmaskGuard {
+    fn set(mask: libc::mode_t) -> Self {
+        Self(unsafe { libc::umask(mask) })
+    }
+}
+impl Drop for UmaskGuard {
+    fn drop(&mut self) {
+        unsafe {
+            libc::umask(self.0);
+        }
+    }
+}
+fn prepare_socket_parent(parent: &Path, root_daemon: bool) -> Result<(), String> {
+    if root_daemon {
+        validate_root_socket_parent(parent)
+    } else {
+        fs::create_dir_all(parent)
+            .map_err(|e| format!("Cannot create socket directory {}: {e}", parent.display()))?;
+        fs::set_permissions(parent, fs::Permissions::from_mode(0o700))
+            .map_err(|e| format!("Cannot secure socket directory {}: {e}", parent.display()))?;
+        Ok(())
+    }
+}
+fn validate_root_socket_parent(parent: &Path) -> Result<(), String> {
+    let metadata = fs::symlink_metadata(parent).map_err(|e| {
+        format!(
+            "Root daemon requires an existing managed socket directory {}: {e}",
+            parent.display()
+        )
+    })?;
+    if !metadata.is_dir() || metadata.file_type().is_symlink() {
+        return Err(format!(
+            "Root daemon socket parent must be a real directory: {}",
+            parent.display()
+        ));
+    }
+    if !root_socket_directory_is_safe(metadata.uid(), metadata.permissions().mode()) {
+        return Err(format!(
+            "Root daemon socket parent must be root-owned and not group/world writable: {}",
+            parent.display()
+        ));
+    }
+    let canonical = fs::canonicalize(parent)
+        .map_err(|e| format!("Cannot resolve socket parent {}: {e}", parent.display()))?;
+    if canonical != parent {
+        return Err(format!(
+            "Root daemon socket parent must not traverse symlinks or dot segments: {}",
+            parent.display()
+        ));
+    }
+    let mut ancestor = canonical.as_path();
+    loop {
+        let metadata = fs::symlink_metadata(ancestor).map_err(|e| {
+            format!(
+                "Cannot inspect socket parent ancestor {}: {e}",
+                ancestor.display()
+            )
+        })?;
+        let mode = metadata.permissions().mode();
+        if !writable_socket_ancestor_is_safe(metadata.uid(), mode) {
+            return Err(format!(
+                "Root daemon socket path traverses an unsafe writable ancestor: {}",
+                ancestor.display()
+            ));
+        }
+        let Some(next) = ancestor.parent() else {
+            break;
+        };
+        if next == ancestor {
+            break;
+        }
+        ancestor = next;
+    }
+    Ok(())
+}
+fn root_socket_directory_is_safe(uid: u32, mode: u32) -> bool {
+    uid == 0 && mode & 0o022 == 0
+}
+fn writable_socket_ancestor_is_safe(uid: u32, mode: u32) -> bool {
+    uid == 0 && (mode & 0o022 == 0 || mode & 0o1000 != 0)
+}
+fn peer(stream: &UnixStream) -> Peer {
+    let mut c = libc::ucred {
+        pid: -1,
+        uid: u32::MAX,
+        gid: u32::MAX,
+    };
+    let mut len = std::mem::size_of::<libc::ucred>() as libc::socklen_t;
+    let rc = unsafe {
+        libc::getsockopt(
+            stream.as_raw_fd(),
+            libc::SOL_SOCKET,
+            libc::SO_PEERCRED,
+            &mut c as *mut _ as *mut libc::c_void,
+            &mut len,
+        )
+    };
+    if rc != 0 || (len as usize) < std::mem::size_of::<libc::ucred>() {
+        return Peer {
+            pid: -1,
+            uid: u32::MAX,
+            gid: u32::MAX,
+            comm: "[unresolved]".into(),
+        };
+    }
+    let comm = fs::read_to_string(format!("/proc/{}/comm", c.pid))
+        .unwrap_or_else(|_| "[exited]".into())
+        .trim()
+        .to_string();
+    Peer {
+        pid: c.pid,
+        uid: c.uid,
+        gid: c.gid,
+        comm,
+    }
+}
+
+impl Daemon {
+    fn client(&self, stream: UnixStream) -> io::Result<()> {
+        let creds = peer(&stream);
+        let mut reader = BufReader::new(stream.try_clone()?);
+        let mut writer = stream;
+        loop {
+            let line = match read_limited_line(&mut reader) {
+                Ok(Some(x)) => x,
+                Ok(None) => break,
+                Err(e) if e.kind() == io::ErrorKind::InvalidData => {
+                    let resp = json!({"jsonrpc":"2.0","id":null,"error":{"code":-32600,"message":format!("Line length exceeded buffer limit ({MAX_BUFFER} bytes)")}});
+                    serde_json::to_writer(&mut writer, &resp).ok();
+                    writer.write_all(b"\n")?;
+                    break;
+                }
+                Err(e) => return Err(e),
+            };
+            let txt = String::from_utf8_lossy(&line);
+            if txt.trim().is_empty() {
+                continue;
+            }
+            let response = self.dispatch(txt.trim(), &creds);
+            serde_json::to_writer(&mut writer, &response).map_err(io::Error::other)?;
+            writer.write_all(b"\n")?;
+            writer.flush()?
+        }
+        Ok(())
+    }
+    fn dispatch(&self, line: &str, p: &Peer) -> Value {
+        let request: Value = match serde_json::from_str(line) {
+            Ok(v) => v,
+            Err(_) => return rpc_error(Value::Null, -32700, "Parse error: Invalid JSON", None),
+        };
+        let id = request.get("id").cloned().unwrap_or(Value::Null);
+        if !request.is_object() || request["jsonrpc"] != "2.0" || request.get("method").is_none() {
+            return rpc_error(
+                id,
+                -32600,
+                "Invalid Request: Malformed JSON-RPC 2.0 payload",
+                None,
+            );
+        }
+        let Some(method) = request["method"].as_str() else {
+            return rpc_error(id, -32600, "Invalid Request: method must be a string", None);
+        };
+        let params = if request.get("params").is_none_or(Value::is_null) {
+            Map::new()
+        } else if let Some(m) = request["params"].as_object() {
+            m.clone()
+        } else {
+            return rpc_error(
+                id,
+                -32602,
+                "Invalid params: Parameters must be an object",
+                None,
+            );
+        };
+        match method {
+            "ping" => rpc_result(
+                id,
+                json!({"status":"ok","version":VERSION,"uptime_sec":(self.started.elapsed().as_secs_f64()*100.).round()/100.,"daemon_pid":std::process::id()}),
+            ),
+            "status" => {
+                let mut s = match self.state.status() {
+                    Ok(status) => status,
+                    Err(error) => {
+                        return rpc_error(
+                            id,
+                            -32603,
+                            format!("Internal audit/state error: {error}"),
+                            Some(json!({"reason":"AUDIT_FAILURE"})),
+                        );
+                    }
+                };
+                if let Some(m) = s.as_object_mut() {
+                    m.insert("socket_path".into(), json!(self.socket));
+                    m.insert("daemon_pid".into(), json!(std::process::id()));
+                }
+                rpc_result(id, s)
+            }
+            "arm" => self.arm_rpc(id, params, p),
+            "disarm" => match self.state.disarm(p.uid) {
+                Ok(result) => rpc_result(id, result),
+                Err(error) => rpc_error(
+                    id,
+                    -32603,
+                    format!("Disarmed, but could not durably audit the transition: {error}"),
+                    Some(json!({"reason":"AUDIT_FAILURE"})),
+                ),
+            },
+            "exec" => self.exec_rpc(id, params, p),
+            _ => rpc_error(id, -32601, format!("Method '{method}' not found"), None),
+        }
+    }
+    fn arm_rpc(&self, id: Value, pms: Map<String, Value>, p: &Peer) -> Value {
+        let forever = match pms.get("forever") {
+            None => false,
+            Some(Value::Bool(v)) => *v,
+            _ => {
+                return rpc_error(
+                    id,
+                    -32602,
+                    "Invalid params: forever must be a boolean",
+                    Some(json!({"reason":"INVALID_PARAMS"})),
+                );
+            }
+        };
+        let explicit = pms.contains_key("duration_seconds") || pms.contains_key("timeout_seconds");
+        if forever && explicit {
+            return rpc_error(
+                id,
+                -32602,
+                "Invalid params: 'forever' and a duration are mutually exclusive",
+                Some(json!({"reason":"INVALID_PARAMS"})),
+            );
+        }
+        let dval = pms
+            .get("duration_seconds")
+            .or_else(|| pms.get("timeout_seconds"));
+        let duration = match dval {
+            None => None,
+            Some(Value::Number(n)) => n.as_u64(),
+            _ => None,
+        };
+        if dval.is_some() && duration.is_none() {
+            return rpc_error(
+                id,
+                -32602,
+                "Invalid params: duration_seconds must be an integer",
+                Some(json!({"reason":"INVALID_PARAMS"})),
+            );
+        }
+        let quota = match pms.get("quota") {
+            None | Some(Value::Null) => None,
+            Some(Value::Number(n)) => n.as_u64(),
+            _ => None,
+        };
+        if pms.get("quota").is_some_and(|v| !v.is_null()) && quota.is_none() {
+            return rpc_error(
+                id,
+                -32602,
+                "Invalid params: quota must be a positive integer",
+                Some(json!({"reason":"INVALID_PARAMS"})),
+            );
+        }
+        match self.state.arm(duration, quota, forever, p.uid, p.pid) {
+            Ok(v) => rpc_result(id, v),
+            Err(e) => rpc_error(id, e.code, e.message, e.reason.map(|r| json!({"reason":r}))),
+        }
+    }
+    fn exec_rpc(&self, id: Value, params: Map<String, Value>, p: &Peer) -> Value {
+        let command = match params.get("command").or_else(|| params.get("cmd")) {
+            None => "".into(),
+            Some(Value::String(s)) => s.clone(),
+            _ => {
+                return rpc_error(
+                    id,
+                    -32602,
+                    "Invalid params: 'command' must be a string",
+                    Some(json!({"reason":"INVALID_PARAMS"})),
+                );
+            }
+        };
+        let raw = params
+            .get("timeout_seconds")
+            .or_else(|| params.get("timeout"));
+        let timeout = match raw {
+            None | Some(Value::Null) => 60.0,
+            Some(Value::Number(n)) => n.as_f64().unwrap_or(-1.),
+            _ => -1.,
+        };
+        if !timeout.is_finite() || timeout <= 0.0 {
+            return rpc_error(
+                id,
+                -32602,
+                "Invalid params: 'timeout_seconds' must be a positive number",
+                Some(json!({"reason":"INVALID_PARAMS"})),
+            );
+        }
+        let timeout = timeout.min(3600.);
+        let workdir = match params.get("workdir") {
+            None => Some("/"),
+            Some(Value::String(s)) => Some(s.as_str()),
+            Some(Value::Null) => None,
+            _ => {
+                return rpc_error(
+                    id,
+                    -32602,
+                    "Invalid params: 'workdir' must be a string",
+                    Some(json!({"reason":"INVALID_PARAMS"})),
+                );
+            }
+        };
+        let env = params.get("env");
+        let rejected = match self
+            .state
+            .reject_if_disarmed(p.pid, p.uid, p.gid, &p.comm, &command)
+        {
+            Ok(rejected) => rejected,
+            Err(error) => {
+                return rpc_error(
+                    id,
+                    -32603,
+                    format!("Internal audit/state error: {error}"),
+                    Some(json!({"reason":"AUDIT_FAILURE"})),
+                );
+            }
+        };
+        if let Some(message) = rejected {
+            let reason = if message.contains("quota") {
+                "QUOTA_EXHAUSTED"
+            } else {
+                "DISARMED"
+            };
+            return rpc_error(id, -32001, message, Some(json!({"reason":reason})));
+        }
+        if command.chars().count() > MAX_COMMAND {
+            let reason = "Command length exceeds 64KB limit";
+            if let Err(error) = self.state.audit_event(
+                "EXEC_BLOCKED",
+                Some(p.pid),
+                Some(p.uid),
+                Some(p.gid),
+                Some(&p.comm),
+                object(&[
+                    (
+                        "command",
+                        json!(format!(
+                            "{}... [truncated]",
+                            command.chars().take(256).collect::<String>()
+                        )),
+                    ),
+                    ("decision", json!("GUARDRAIL_BLOCKED")),
+                    ("rule", json!("RULE_COMMAND_LENGTH_EXCEEDED")),
+                    ("reason", json!(reason)),
+                    ("exit_code", json!(126)),
+                    ("category", json!("resource")),
+                ]),
+            ) {
+                return rpc_error(
+                    id,
+                    -32603,
+                    format!("Internal audit error: {error}"),
+                    Some(json!({"reason":"AUDIT_FAILURE"})),
+                );
+            }
+            return rpc_error(
+                id,
+                -32002,
+                format!("Destabilization guardrail violation: {reason}"),
+                Some(
+                    json!({"rule":"RULE_COMMAND_LENGTH_EXCEEDED","reason":reason,"category":"resource"}),
+                ),
+            );
+        }
+        let _exec = self.exec_lock.lock().unwrap_or_else(|e| e.into_inner());
+        let rejected = match self
+            .state
+            .reject_if_disarmed(p.pid, p.uid, p.gid, &p.comm, &command)
+        {
+            Ok(rejected) => rejected,
+            Err(error) => {
+                return rpc_error(
+                    id,
+                    -32603,
+                    format!("Internal audit/state error: {error}"),
+                    Some(json!({"reason":"AUDIT_FAILURE"})),
+                );
+            }
+        };
+        if let Some(message) = rejected {
+            let reason = if message.contains("quota") {
+                "QUOTA_EXHAUSTED"
+            } else {
+                "DISARMED"
+            };
+            return rpc_error(id, -32001, message, Some(json!({"reason":reason})));
+        }
+        let resolved_workdir = match self.executor.resolve_workdir(workdir) {
+            Ok(directory) => directory,
+            Err(error) => {
+                let (code, message, data) = executor::error(error);
+                return rpc_error(id, code, message, Some(data));
+            }
+        };
+        let verdict = guardrails::evaluate_at(&command, &resolved_workdir.path);
+        if !verdict.allowed {
+            let rule = verdict.rule.unwrap_or("RULE_GUARDRAIL");
+            let reason = verdict.reason;
+            let category = verdict.category;
+            if let Err(error) = self.state.audit_event(
+                "EXEC_BLOCKED",
+                Some(p.pid),
+                Some(p.uid),
+                Some(p.gid),
+                Some(&p.comm),
+                object(&[
+                    ("command", json!(command)),
+                    ("decision", json!("GUARDRAIL_BLOCKED")),
+                    ("rule", json!(rule)),
+                    ("reason", json!(reason)),
+                    ("exit_code", json!(126)),
+                    (
+                        "category",
+                        category.map(|x| json!(x)).unwrap_or(Value::Null),
+                    ),
+                ]),
+            ) {
+                return rpc_error(
+                    id,
+                    -32603,
+                    format!("Internal audit error: {error}"),
+                    Some(json!({"reason":"AUDIT_FAILURE"})),
+                );
+            }
+            return rpc_error(
+                id,
+                -32002,
+                format!("Destabilization guardrail violation: {reason}"),
+                Some(json!({"rule":rule,"reason":reason,"category":category})),
+            );
+        }
+        let admission = match self.state.admit(p.pid, p.uid, p.gid, &p.comm, &command) {
+            Ok(a) => a,
+            Err(e) => {
+                let reason = if e.contains("quota") {
+                    "QUOTA_EXHAUSTED"
+                } else {
+                    "DISARMED"
+                };
+                return rpc_error(id, -32001, e, Some(json!({"reason":reason})));
+            }
+        };
+        let effective = admission
+            .remaining_seconds
+            .filter(|x| *x > 0.)
+            .map(|x| timeout.min(x))
+            .unwrap_or(timeout);
+        if let Err(error) = self.state.audit_event(
+            "EXEC_START",
+            Some(p.pid),
+            Some(p.uid),
+            Some(p.gid),
+            Some(&p.comm),
+            object(&[("command", json!(command)), ("decision", json!("ADMITTED"))]),
+        ) {
+            return rpc_error(
+                id,
+                -32603,
+                format!("Internal audit error: {error}"),
+                Some(json!({"reason":"AUDIT_FAILURE"})),
+            );
+        }
+        match self
+            .executor
+            .execute(&command, effective, &resolved_workdir, env, &admission)
+        {
+            Err(e) => {
+                if let Err(audit_error) = self.state.refund_quota() {
+                    return rpc_error(
+                        id,
+                        -32603,
+                        format!(
+                            "Execution failed and quota refund could not be audited: {audit_error}"
+                        ),
+                        Some(json!({"reason":"AUDIT_FAILURE"})),
+                    );
+                }
+                let (code, msg, data) = executor::error(e);
+                rpc_error(id, code, msg, Some(data))
+            }
+            Ok(result) => {
+                let val = result.value();
+                let event_type = if result.timed_out {
+                    "EXEC_TIMEOUT"
+                } else {
+                    "EXEC_ALLOWED"
+                };
+                let mut event_data = object(&[
+                    ("command", json!(command)),
+                    ("exit_code", json!(result.exit_code)),
+                    ("duration_ms", json!(result.duration_ms)),
+                    ("timed_out", json!(result.timed_out)),
+                ]);
+                if !result.timed_out {
+                    event_data.insert("decision".into(), json!("ALLOWED"));
+                }
+                if let Err(error) = self
+                    .state
+                    .record_execution(event_type, p.pid, p.uid, p.gid, &p.comm, event_data)
+                {
+                    return rpc_error(
+                        id,
+                        -32603,
+                        format!(
+                            "Command completed but its result could not be durably audited: {error}"
+                        ),
+                        Some(json!({"reason":"AUDIT_FAILURE"})),
+                    );
+                }
+                if result.timed_out {
+                    rpc_error(
+                        id,
+                        -32004,
+                        format!("Execution timed out after {effective:?}s"),
+                        Some(val),
+                    )
+                } else {
+                    rpc_result(id, val)
+                }
+            }
+        }
+    }
+}
+fn read_limited_line<R: BufRead>(reader: &mut R) -> io::Result<Option<Vec<u8>>> {
+    let mut line = Vec::new();
+    loop {
+        let buf = reader.fill_buf()?;
+        if buf.is_empty() {
+            return if line.is_empty() {
+                Ok(None)
+            } else {
+                Ok(Some(line))
+            };
+        }
+        let n = buf
+            .iter()
+            .position(|b| *b == b'\n')
+            .map(|i| i + 1)
+            .unwrap_or(buf.len());
+        line.extend_from_slice(&buf[..n]);
+        reader.consume(n);
+        if line.len() > MAX_BUFFER {
+            return Err(io::Error::new(io::ErrorKind::InvalidData, "line too long"));
+        }
+        if line.last() == Some(&b'\n') {
+            return Ok(Some(line));
+        }
+    }
+}
+fn rpc_result(id: Value, result: Value) -> Value {
+    json!({"jsonrpc":"2.0","id":id,"result":result})
+}
+fn rpc_error(id: Value, code: i64, message: impl Into<String>, data: Option<Value>) -> Value {
+    let mut error = json!({"code":code,"message":message.into()});
+    if let Some(d) = data {
+        error["data"] = d
+    }
+    json!({"jsonrpc":"2.0","id":id,"error":error})
+}
+
+fn mcp(socket: Option<&Path>) -> Result<i32, String> {
+    let path = resolve_socket(socket);
+    let stdin = io::stdin();
+    let stdout = io::stdout();
+    let mut output = stdout.lock();
+    for line in stdin.lock().lines() {
+        let line = line.map_err(|e| e.to_string())?;
+        if line.trim().is_empty() {
+            continue;
+        }
+        let req: Value = match serde_json::from_str(&line) {
+            Ok(v) => v,
+            Err(_) => {
+                writeln!(
+                    output,
+                    "{}",
+                    rpc_error(Value::Null, -32700, "Parse error", None)
+                )
+                .map_err(|e| e.to_string())?;
+                output.flush().map_err(|e| e.to_string())?;
+                continue;
+            }
+        };
+        let notification = req.get("id").is_none();
+        let id = req.get("id").cloned().unwrap_or(Value::Null);
+        let Some(method) = req["method"].as_str() else {
+            if !notification {
+                writeln!(
+                    output,
+                    "{}",
+                    rpc_error(id, -32600, "Invalid Request: missing method", None)
+                )
+                .map_err(|e| e.to_string())?;
+                output.flush().map_err(|e| e.to_string())?;
+            }
+            continue;
+        };
+        if method.starts_with("notifications/") {
+            continue;
+        }
+        let params = match req.get("params") {
+            None | Some(Value::Null) => Map::new(),
+            Some(value) => match value.as_object() {
+                Some(params) => params.clone(),
+                None => {
+                    if !notification {
+                        let response =
+                            rpc_error(id, -32602, "Invalid params: expected an object", None);
+                        serde_json::to_writer(&mut output, &response).map_err(|e| e.to_string())?;
+                        output.write_all(b"\n").map_err(|e| e.to_string())?;
+                        output.flush().map_err(|e| e.to_string())?;
+                    }
+                    continue;
+                }
+            },
+        };
+        let response = match method {
+            "initialize" => {
+                let requested = params
+                    .get("protocolVersion")
+                    .and_then(Value::as_str)
+                    .unwrap_or("");
+                let protocol = if ["2024-11-05", "2025-03-26", "2025-06-18"].contains(&requested) {
+                    requested
+                } else {
+                    "2024-11-05"
+                };
+                Some(rpc_result(
+                    id,
+                    json!({"protocolVersion":protocol,"capabilities":{"tools":{}},"serverInfo":{"name":"agent-root-mcp","version":VERSION}}),
+                ))
+            }
+            "tools/list" => Some(rpc_result(id, tools_schema())),
+            "ping" => Some(rpc_result(id, json!({"pong":true}))),
+            "tools/call" => Some(mcp_call(id, &params, &path)),
+            _ => {
+                if notification {
+                    None
+                } else {
+                    Some(rpc_error(
+                        id,
+                        -32601,
+                        format!("Method not found: {method}"),
+                        None,
+                    ))
+                }
+            }
+        };
+        if notification {
+            continue;
+        }
+        if let Some(v) = response {
+            serde_json::to_writer(&mut output, &v).map_err(|e| e.to_string())?;
+            output.write_all(b"\n").map_err(|e| e.to_string())?;
+            output.flush().map_err(|e| e.to_string())?
+        }
+    }
+    Ok(0)
+}
+fn tools_schema() -> Value {
+    json!({"tools":[{"name":"run_privileged_command","description":"Execute a shell command with root privileges via the agent-root-runner daemon. Requires the daemon to be armed (sudo agent-root-runner arm).","inputSchema":{"type":"object","properties":{"command":{"type":"string","description":"Shell command to execute (e.g. 'smartctl -a /dev/nvme0n1', 'systemctl restart nginx')"},"timeout":{"type":"integer","description":"Command timeout in seconds (default: 60)","default":60,"minimum":1,"maximum":3600},"workdir":{"type":"string","description":"Working directory (default: /)","default":"/"},"env":{"type":"object","description":"Additional environment variables","additionalProperties":{"type":"string"}}},"required":["command"]}}]})
+}
+fn mcp_call(id: Value, params: &Map<String, Value>, socket: &Path) -> Value {
+    let name = params.get("name").and_then(Value::as_str).unwrap_or("");
+    if name != "run_privileged_command" {
+        return rpc_error(id, -32601, format!("Unknown tool: {name}"), None);
+    }
+    let args = params.get("arguments").and_then(Value::as_object);
+    let Some(args) = args else {
+        return rpc_error(
+            id,
+            -32602,
+            "Invalid params: 'arguments' must be an object",
+            None,
+        );
+    };
+    let Some(command) = args
+        .get("command")
+        .and_then(Value::as_str)
+        .filter(|x| !x.is_empty())
+    else {
+        return rpc_error(
+            id,
+            -32602,
+            "Missing or invalid required argument: command",
+            None,
+        );
+    };
+    let timeout = match args.get("timeout") {
+        None => 60,
+        Some(value) => match value.as_u64() {
+            Some(value) if value > 0 => value,
+            _ => {
+                return rpc_error(
+                    id,
+                    -32602,
+                    "Invalid argument: 'timeout' must be a positive integer",
+                    None,
+                );
+            }
+        },
+    };
+    let workdir = match args.get("workdir") {
+        None => "/",
+        Some(Value::String(value)) => value.as_str(),
+        _ => {
+            return rpc_error(
+                id,
+                -32602,
+                "Invalid argument: 'workdir' must be a string",
+                None,
+            );
+        }
+    };
+    let env = args.get("env").cloned().unwrap_or_else(|| json!({}));
+    let mut call = Map::new();
+    call.insert("command".into(), json!(command));
+    call.insert("timeout_seconds".into(), json!(timeout));
+    call.insert("workdir".into(), json!(workdir));
+    call.insert("env".into(), env);
+    let response = match rpc(
+        socket,
+        "exec",
+        call,
+        Duration::from_secs(timeout.min(3600) + 10),
+    ) {
+        Ok(v) => v,
+        Err(e) => {
+            return rpc_error(
+                id,
+                -32000,
+                format!("Daemon connection failed: {e}"),
+                Some(json!({"reason":"DAEMON_ERROR"})),
+            );
+        }
+    };
+    if let Some(err) = response.get("error") {
+        let code = err["code"].as_i64().unwrap_or(-32603);
+        let reason = err["data"]["reason"].as_str().unwrap_or("");
+        if (-32004..=-32001).contains(&code) {
+            let text = err["message"].as_str().unwrap_or(reason);
+            return rpc_result(
+                id,
+                json!({"content":[{"type":"text","text":text}],"isError":true,"_meta":{"daemon_code":code,"reason":reason,"stderr":err["data"]["stderr"]}}),
+            );
+        }
+        return rpc_error(
+            id,
+            code,
+            err["message"].as_str().unwrap_or("Daemon error"),
+            Some(json!({"reason":reason})),
+        );
+    }
+    let result = &response["result"];
+    let stdout = result["stdout"].as_str().unwrap_or("");
+    let stderr = result["stderr"].as_str().unwrap_or("");
+    let code = result["exit_code"].as_i64().unwrap_or(0);
+    let text = if code != 0 {
+        if !stdout.is_empty() {
+            format!("{stdout}\n{stderr}").trim().to_string()
+        } else {
+            stderr.into()
+        }
+    } else {
+        stdout.into()
+    };
+    rpc_result(
+        id,
+        json!({"content":[{"type":"text","text":text}],"isError":code!=0,"_meta":{"exit_code":code,"stderr":stderr,"duration_ms":result["duration_ms"]}}),
+    )
+}
+
+const UNIT_PATH: &str = "/etc/systemd/system/agent-root-runner.service";
+const BIN_PATH: &str = "/usr/local/bin/agent-root-runner";
+const MANIFEST_PATH: &str = "/etc/agent-root-runner/installed-files";
+fn install() -> Result<i32, String> {
+    if unsafe { libc::geteuid() } != 0 {
+        return Err("install requires root. Run with sudo.".into());
+    }
+    let source = std::env::current_exe().map_err(|e| e.to_string())?;
+    let dest = Path::new(BIN_PATH);
+    if source != dest {
+        let tmp = Path::new("/usr/local/bin/.agent-root-runner.new");
+        let _ = fs::remove_file(tmp);
+        fs::copy(&source, tmp).map_err(|e| format!("Could not install executable: {e}"))?;
+        fs::set_permissions(tmp, fs::Permissions::from_mode(0o755)).map_err(|e| e.to_string())?;
+        fs::rename(tmp, dest).map_err(|e| format!("Could not activate executable: {e}"))?;
+    }
+    println!("Installed: {BIN_PATH}");
+    let unit = Path::new(UNIT_PATH);
+    if let Some(parent) = unit.parent() {
+        fs::create_dir_all(parent).map_err(|e| e.to_string())?
+    }
+    write_secure(unit, UNIT_TEXT.as_bytes(), 0o644)?;
+    println!("Installed systemd unit: {UNIT_PATH}");
+    let mpath = Path::new(MANIFEST_PATH);
+    fs::create_dir_all(mpath.parent().unwrap()).map_err(|e| e.to_string())?;
+    write_secure(
+        mpath,
+        format!("{BIN_PATH}\n{UNIT_PATH}\n").as_bytes(),
+        0o600,
+    )?;
+    remove_legacy_install_artifacts(Path::new("/usr/local"))
+        .map_err(|e| format!("Could not remove legacy installation files: {e}"))?;
+    let _ = systemctl(&["daemon-reload"]);
+    let _ = systemctl(&["enable", "agent-root-runner.service"]);
+    if systemctl(&["restart", "agent-root-runner.service"]) != 0 {
+        let _ = systemctl(&["status", "agent-root-runner.service", "--no-pager"]);
+        return Err("failed to start agent-root-runner.service".into());
+    }
+    thread::sleep(Duration::from_millis(500));
+    if systemctl(&["is-active", "--quiet", "agent-root-runner.service"]) != 0 {
+        let _ = systemctl(&["status", "agent-root-runner.service", "--no-pager"]);
+        return Err("agent-root-runner.service is not active after start".into());
+    }
+    println!("agent-root-runner.service is active.");
+    Ok(0)
+}
+fn uninstall() -> Result<i32, String> {
+    if unsafe { libc::geteuid() } != 0 {
+        return Err("uninstall requires root. Run with sudo.".into());
+    }
+    let _ = systemctl(&["stop", "agent-root-runner.service"]);
+    let _ = systemctl(&["disable", "agent-root-runner.service"]);
+    let manifest = fs::read_to_string(MANIFEST_PATH).unwrap_or_default();
+    if manifest.lines().any(|x| x == UNIT_PATH) {
+        match fs::remove_file(UNIT_PATH) {
+            Ok(()) => println!("Removed: {UNIT_PATH}"),
+            Err(e) if e.kind() == io::ErrorKind::NotFound => (),
+            Err(e) => return Err(format!("Could not remove service unit: {e}")),
+        }
+    }
+    let _ = systemctl(&["daemon-reload"]);
+    let _ = systemctl(&["reset-failed", "agent-root-runner.service"]);
+    if manifest.lines().any(|x| x == BIN_PATH) {
+        let current = std::env::current_exe().unwrap_or_default();
+        if current != Path::new(BIN_PATH) {
+            match fs::remove_file(BIN_PATH) {
+                Ok(()) => println!("Removed: {BIN_PATH}"),
+                Err(e) if e.kind() == io::ErrorKind::NotFound => (),
+                Err(e) => eprintln!("Warning: could not remove {BIN_PATH}: {e}"),
+            }
+        }
+    }
+    let _ = fs::remove_file(MANIFEST_PATH);
+    let _ = fs::remove_dir("/etc/agent-root-runner");
+    let _ = fs::remove_dir("/run/agent-root-runner");
+    println!("Note: audit logs under /var/log/agent-root-runner are preserved.");
+    Ok(0)
+}
+fn write_secure(path: &Path, bytes: &[u8], mode: u32) -> Result<(), String> {
+    let mut f = OpenOptions::new()
+        .create(true)
+        .truncate(true)
+        .write(true)
+        .mode(mode)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        .open(path)
+        .map_err(|e| format!("Cannot write {}: {e}", path.display()))?;
+    f.write_all(bytes).map_err(|e| e.to_string())?;
+    f.sync_all().map_err(|e| e.to_string())?;
+    fs::set_permissions(path, fs::Permissions::from_mode(mode)).map_err(|e| e.to_string())
+}
+fn remove_legacy_install_artifacts(usr_local: &Path) -> io::Result<()> {
+    for relative in [
+        "bin/agent-root-runner-daemon",
+        "bin/agent-root-exec",
+        "bin/agent-root-mcp",
+        "lib/agent-root-runner",
+    ] {
+        let path = usr_local.join(relative);
+        match fs::symlink_metadata(&path) {
+            Ok(metadata) if metadata.file_type().is_dir() => fs::remove_dir_all(path)?,
+            Ok(_) => fs::remove_file(path)?,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => (),
+            Err(error) => return Err(error),
+        }
+    }
+    Ok(())
+}
+fn systemctl(args: &[&str]) -> i32 {
+    // Do not resolve a root management utility through a caller-controlled PATH.
+    let mut c = Command::new("/usr/bin/systemctl");
+    c.args(args).env_remove("LD_PRELOAD");
+    match c.status() {
+        Ok(s) => s.code().unwrap_or(128),
+        Err(e) => {
+            eprintln!("Could not run systemctl: {e}");
+            128
+        }
+    }
+}
+
+#[cfg(test)]
+mod socket_parent_tests {
+    use super::*;
+
+    #[test]
+    fn native_install_cleanup_removes_only_legacy_paths() {
+        let root = std::env::temp_dir().join(format!(
+            "arr-legacy-install-{}-{}",
+            std::process::id(),
+            uuid::Uuid::new_v4()
+        ));
+        let bin = root.join("bin");
+        let legacy_lib = root.join("lib/agent-root-runner/nested");
+        fs::create_dir_all(&bin).unwrap();
+        fs::create_dir_all(&legacy_lib).unwrap();
+        for name in [
+            "agent-root-runner-daemon",
+            "agent-root-exec",
+            "agent-root-mcp",
+            "agent-root-runner",
+            "unrelated-tool",
+        ] {
+            fs::write(bin.join(name), "sentinel").unwrap();
+        }
+        fs::write(legacy_lib.join("server.py"), "sentinel").unwrap();
+
+        remove_legacy_install_artifacts(&root).unwrap();
+
+        for name in [
+            "agent-root-runner-daemon",
+            "agent-root-exec",
+            "agent-root-mcp",
+        ] {
+            assert!(!bin.join(name).exists(), "legacy launcher remains: {name}");
+        }
+        assert!(bin.join("agent-root-runner").exists());
+        assert!(bin.join("unrelated-tool").exists());
+        assert!(!root.join("lib/agent-root-runner").exists());
+
+        let external = root.with_extension("external");
+        fs::create_dir_all(&external).unwrap();
+        fs::write(external.join("keep"), "outside legacy tree").unwrap();
+        std::os::unix::fs::symlink(&external, root.join("lib/agent-root-runner")).unwrap();
+        remove_legacy_install_artifacts(&root).unwrap();
+        assert!(external.join("keep").exists());
+        assert!(!root.join("lib/agent-root-runner").exists());
+
+        fs::remove_dir_all(external).unwrap();
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn root_socket_parent_policy_rejects_shared_or_redirected_paths_without_mutation() {
+        assert!(root_socket_directory_is_safe(0, 0o750));
+        assert!(!root_socket_directory_is_safe(0, 0o1777));
+        assert!(!root_socket_directory_is_safe(1000, 0o700));
+        assert!(writable_socket_ancestor_is_safe(0, 0o755));
+        assert!(writable_socket_ancestor_is_safe(0, 0o1777));
+        assert!(!writable_socket_ancestor_is_safe(1000, 0o1777));
+        assert!(!writable_socket_ancestor_is_safe(1000, 0o700));
+        assert!(!writable_socket_ancestor_is_safe(0, 0o0777));
+
+        let root = std::env::temp_dir().join(format!(
+            "arr-socket-parent-{}-{}",
+            std::process::id(),
+            uuid::Uuid::new_v4()
+        ));
+        fs::create_dir(&root).unwrap();
+        let direct = root.join("shared");
+        fs::create_dir(&direct).unwrap();
+        fs::set_permissions(&direct, fs::Permissions::from_mode(0o1777)).unwrap();
+        let shared_mode_before = fs::metadata(&direct).unwrap().permissions().mode() & 0o7777;
+        assert!(prepare_socket_parent(&direct, true).is_err());
+        assert_eq!(
+            fs::metadata(&direct).unwrap().permissions().mode() & 0o7777,
+            shared_mode_before
+        );
+
+        let owner_writable = root.join("owner-writable");
+        fs::create_dir(&owner_writable).unwrap();
+        fs::set_permissions(&owner_writable, fs::Permissions::from_mode(0o700)).unwrap();
+        let owner_mode_before =
+            fs::metadata(&owner_writable).unwrap().permissions().mode() & 0o7777;
+        assert!(prepare_socket_parent(&owner_writable, true).is_err());
+        assert_eq!(
+            fs::metadata(&owner_writable).unwrap().permissions().mode() & 0o7777,
+            owner_mode_before
+        );
+
+        let redirected = root.join("redirected");
+        std::os::unix::fs::symlink(&direct, &redirected).unwrap();
+        assert!(prepare_socket_parent(&redirected, true).is_err());
+        assert_eq!(
+            fs::metadata(&direct).unwrap().permissions().mode() & 0o7777,
+            shared_mode_before
+        );
+        let shared_before = fs::metadata("/tmp").unwrap();
+        assert!(prepare_socket_parent(Path::new("/tmp"), true).is_err());
+        let shared_after = fs::metadata("/tmp").unwrap();
+        assert_eq!(shared_before.uid(), shared_after.uid());
+        assert_eq!(
+            shared_before.permissions().mode() & 0o7777,
+            shared_after.permissions().mode() & 0o7777
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+}

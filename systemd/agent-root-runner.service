@@ -4,7 +4,7 @@ After=network.target
 
 [Service]
 Type=simple
-ExecStart=/usr/local/bin/agent-root-runner-daemon --socket /run/agent-root-runner/runner.sock --audit-log /var/log/agent-root-runner/audit.log
+ExecStart=/usr/local/bin/agent-root-runner daemon --socket /run/agent-root-runner/runner.sock --audit-log /var/log/agent-root-runner/audit.log
 User=root
 Group=wheel
 RuntimeDirectory=agent-root-runner
