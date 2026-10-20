@@ -7,7 +7,7 @@ on:
 if: github.event.pull_request.draft == false
 engine:
   id: copilot
-  model: claude-haiku-4.5
+  model: gpt-5.6-luna
 imports:
   - .github/agents/security-reviewer.agent.md
 permissions:
