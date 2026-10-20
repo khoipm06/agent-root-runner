@@ -5,7 +5,9 @@ on:
   pull_request:
     types: [opened, reopened, synchronize, ready_for_review]
 if: github.event.pull_request.draft == false
-engine: copilot
+engine:
+  id: copilot
+  model: claude-haiku-4.5
 imports:
   - .github/agents/security-reviewer.agent.md
 permissions:
