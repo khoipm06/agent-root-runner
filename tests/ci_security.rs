@@ -6,6 +6,7 @@ const AI_REVIEW_LOCK: &str = include_str!("../.github/workflows/ai-pr-review.loc
 const ISSUE_TRIAGE_SOURCE: &str = include_str!("../.github/workflows/ai-issue-triage.md");
 const ISSUE_TRIAGE_LOCK: &str = include_str!("../.github/workflows/ai-issue-triage.lock.yml");
 const COPILOT_GUIDANCE: &str = include_str!("../.github/copilot-instructions.md");
+const NATIVE_RUNTIME_TESTS: &str = include_str!("native_runtime.rs");
 
 fn job_block(document: &str, name: &str) -> String {
     let marker = format!("  {name}:\n");
@@ -265,6 +266,21 @@ fn candidate_code_jobs_are_read_only_and_native_only() {
     }
     assert!(WORKFLOW.contains("cargo test --locked --all-targets"));
     assert!(WORKFLOW.contains("cargo test --locked --release --test release_runtime"));
+}
+
+#[test]
+fn protected_path_payload_tests_require_explicit_authorization() {
+    let ignore = "#[test]\n#[ignore = \"submits protected-path payloads; requires explicit authorization\"]\n";
+    for name in [
+        "native_socket_state_quota_guardrail_audit_and_modes",
+        "real_daemon_blocks_m4_and_wrapper_evasion_probes",
+        "daemon_guardrails_use_the_actual_workdir_and_follow_its_symlinks",
+    ] {
+        assert!(
+            NATIVE_RUNTIME_TESTS.contains(&format!("{ignore}fn {name}()")),
+            "protected-path test {name} must remain ignored by default"
+        );
+    }
 }
 
 #[test]
