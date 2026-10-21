@@ -318,13 +318,13 @@ impl Executor {
                 }
             }
         };
+        let ms = (start.elapsed().as_secs_f64() * 1000. * 100.).round() / 100.;
         kill_process_tree(pgid);
         let (out, otrun) = ot.join().unwrap_or_default();
         let (err, etru) = et.join().unwrap_or_default();
         let _ = self
             .pgid
             .compare_exchange(pgid, 0, Ordering::SeqCst, Ordering::SeqCst);
-        let ms = (start.elapsed().as_secs_f64() * 1000. * 100.).round() / 100.;
         let mut out = String::from_utf8_lossy(&out).into_owned();
         let mut err = String::from_utf8_lossy(&err).into_owned();
         if otrun {

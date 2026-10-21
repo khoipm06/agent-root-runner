@@ -199,11 +199,7 @@ impl StateMachine {
         let old = g.armed;
         let prev = if old { "ARMED" } else { "DISARMED" };
         let sid = g.session.as_ref().map(|s| json!(s.id));
-        let elapsed = g
-            .session
-            .as_ref()
-            .map(|s| s.started.elapsed().unwrap_or_default().as_secs_f64())
-            .unwrap_or(0.);
+        let elapsed = active_elapsed(&g);
         let n = g.commands;
         g.armed = false;
         g.last = Some("MANUAL_DISARM".into());
@@ -240,11 +236,7 @@ impl StateMachine {
             return Err("Audit logging previously failed; the daemon is fail-closed.".into());
         }
         let sid = g.session.as_ref().map(|s| json!(s.id));
-        let elapsed = g
-            .session
-            .as_ref()
-            .map(|s| s.started.elapsed().unwrap_or_default().as_secs_f64())
-            .unwrap_or(0.);
+        let elapsed = active_elapsed(&g);
         g.armed = false;
         g.last = Some("SHUTDOWN".into());
         g.generation += 1;
@@ -581,11 +573,7 @@ impl StateMachine {
             .as_ref()
             .map(|s| json!(s.id.clone()))
             .unwrap_or(Value::Null);
-        let elapsed = g
-            .session
-            .as_ref()
-            .map(|s| s.started.elapsed().unwrap_or_default().as_secs_f64())
-            .unwrap_or(0.);
+        let elapsed = active_elapsed(&g);
         g.armed = false;
         g.last = Some(reason.into());
         if was {
@@ -657,23 +645,34 @@ fn expired(g: &Inner) -> bool {
         })
         .unwrap_or(false)
 }
+fn active_elapsed(g: &Inner) -> f64 {
+    g.session
+        .as_ref()
+        .map(|s| {
+            let elapsed = s.mono.elapsed().as_secs_f64();
+            s.duration.map(|d| elapsed.min(d as f64)).unwrap_or(elapsed)
+        })
+        .unwrap_or(0.)
+}
 fn status_inner(g: &Inner) -> Value {
     let s = g.session.as_ref();
-    let duration = s.and_then(|s| s.duration);
+    let timed = if g.armed { s } else { None };
+    let duration = timed.and_then(|s| s.duration);
     let forever = g.armed && s.is_some_and(|s| s.duration.is_none());
     let rem = if !g.armed {
-        Some(json!(0.))
+        None
     } else if forever {
         None
     } else {
         s.and_then(|s| {
             s.duration.map(|d| {
-                json!(((d as f64 - s.mono.elapsed().as_secs_f64()).max(0.) * 10.).round() / 10.)
+                let left = (d as f64 - s.mono.elapsed().as_secs_f64()).max(0.);
+                json!((left * 10.).ceil() / 10.)
             })
         })
     };
-    let exp = s.and_then(|s| s.duration.map(|d| ts(s.started + Duration::from_secs(d))));
-    json!({"state":if g.armed{"ARMED"}else{"DISARMED"},"is_armed":g.armed,"forever":forever,"session_id":s.map(|s|json!(s.id)).unwrap_or(Value::Null),"armed_at":s.map(|s|json!(ts(s.started))).unwrap_or(Value::Null),"expires_at":exp.map(|x|json!(x)).unwrap_or(Value::Null),"remaining_seconds":rem.unwrap_or(Value::Null),"timeout_seconds":duration.map(|x|json!(x)).unwrap_or(Value::Null),"duration_seconds":duration.map(|x|json!(x)).unwrap_or(Value::Null),"quota_limit":s.and_then(|s|s.quota).map(|x|json!(x)).unwrap_or(Value::Null),"quota":s.and_then(|s|s.quota).map(|x|json!(x)).unwrap_or(Value::Null),"quota_remaining":s.and_then(|s|s.left).map(|x|json!(x)).unwrap_or(Value::Null),"commands_executed":g.commands,"lifetime_commands":g.lifetime})
+    let exp = timed.and_then(|s| s.duration.map(|d| ts(s.started + Duration::from_secs(d))));
+    json!({"state":if g.armed{"ARMED"}else{"DISARMED"},"is_armed":g.armed,"forever":forever,"session_id":timed.map(|s|json!(s.id)).unwrap_or(Value::Null),"armed_at":timed.map(|s|json!(ts(s.started))).unwrap_or(Value::Null),"expires_at":exp.map(|x|json!(x)).unwrap_or(Value::Null),"remaining_seconds":rem.unwrap_or(Value::Null),"timeout_seconds":duration.map(|x|json!(x)).unwrap_or(Value::Null),"duration_seconds":duration.map(|x|json!(x)).unwrap_or(Value::Null),"quota_limit":s.and_then(|s|s.quota).map(|x|json!(x)).unwrap_or(Value::Null),"quota":s.and_then(|s|s.quota).map(|x|json!(x)).unwrap_or(Value::Null),"quota_remaining":s.and_then(|s|s.left).map(|x|json!(x)).unwrap_or(Value::Null),"commands_executed":g.commands,"lifetime_commands":g.lifetime})
 }
 fn ts(t: SystemTime) -> String {
     let dt: DateTime<Utc> = t.into();
@@ -1000,5 +999,55 @@ mod tests {
         assert_eq!(a.status().unwrap()["state"], "DISARMED");
         let _ = fs::remove_file(p);
         let _ = fs::remove_file(p2);
+    }
+    #[test]
+    fn disarmed_status_omits_stale_session_times() {
+        let (m, p) = machine();
+        m.arm(Some(60), None, false, 0, 1).unwrap();
+        let armed = m.status().unwrap();
+        assert!(armed["armed_at"].is_string());
+        assert!(armed["expires_at"].is_string());
+        assert!(armed["remaining_seconds"].is_number());
+
+        m.disarm(0).unwrap();
+        let s = m.status().unwrap();
+        assert_eq!(s["state"], "DISARMED");
+        for key in [
+            "session_id",
+            "armed_at",
+            "expires_at",
+            "remaining_seconds",
+            "timeout_seconds",
+            "duration_seconds",
+        ] {
+            assert!(
+                s[key].is_null(),
+                "disarmed status leaked stale {key}: {}",
+                s[key]
+            );
+        }
+        let _ = fs::remove_file(p);
+    }
+    #[test]
+    fn audit_active_duration_uses_monotonic_and_caps_at_session_duration() {
+        let (m, p) = machine();
+        m.arm(Some(1), None, false, 0, 1).unwrap();
+        thread::sleep(Duration::from_millis(1_200));
+        // status() performs the TIMEOUT_EXPIRED transition for the expired session.
+        assert_eq!(m.status().unwrap()["state"], "DISARMED");
+        let log = fs::read_to_string(&p).unwrap();
+        let expired = log
+            .lines()
+            .filter_map(|l| serde_json::from_str::<Value>(l).ok())
+            .find(|v| v["event_type"] == "TIMEOUT_LOCK")
+            .expect("timeout audit record");
+        let active = expired["active_duration_seconds"]
+            .as_f64()
+            .expect("active duration");
+        assert!(
+            active <= 1.0,
+            "active duration {active}s exceeded the 1s session"
+        );
+        let _ = fs::remove_file(p);
     }
 }
