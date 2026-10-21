@@ -24,7 +24,7 @@ safe-outputs:
     max: 1
     target: triggering
     allowed-events: [COMMENT]
-max-turns: 25
+max-turns: 60
 timeout-minutes: 15
 ---
 
@@ -36,4 +36,4 @@ Prioritize the privilege boundary: socket authentication and peer credentials; r
 
 Only report a finding if it is introduced by this PR, supported by exact changed-line evidence, and actionable. For each inline comment, explain the failure scenario and impact briefly. Do not repeat unchanged code, make style-only suggestions, speculate, or report a concern without evidence. Do not reveal secrets or publish detailed exploit instructions. If there are no material findings, submit a short review saying so and mention any important validation that could not be verified.
 
-Submit one `COMMENT` review with a concise severity-grouped summary; add inline comments only for specific defects on changed lines. This workflow is advisory: never approve, request changes, merge, or modify the PR.
+Submit one `COMMENT` review with a concise severity-grouped summary; add inline comments only for specific defects on changed lines. Always submit that review, including when you found nothing: a short "no actionable findings" review, plus any validation you could not verify. Do not finish with only a noop, because maintainers need visible evidence that the review ran. This workflow is advisory: never approve, request changes, merge, or modify the PR.
