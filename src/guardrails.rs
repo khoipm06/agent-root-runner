@@ -5,7 +5,7 @@ use std::{
     ffi::OsString,
     fs,
     path::{Component, Path, PathBuf},
-    sync::{Mutex, OnceLock},
+    sync::{LazyLock, Mutex, OnceLock},
 };
 
 #[derive(Clone, Debug, Default)]
@@ -27,6 +27,7 @@ struct Cmd {
     external: bool,
     script_checked: bool,
     cwd: Option<PathBuf>,
+    process_sub: bool,
 }
 #[derive(Clone, Debug)]
 pub struct Verdict {
@@ -77,6 +78,8 @@ const DESTRUCTIVE: &[&str] = &[
     "install",
     "tee",
     "find",
+    "chattr",
+    "setfacl",
 ];
 const SHELLS: &[&str] = &[
     "sh", "bash", "zsh", "dash", "ksh", "csh", "tcsh", "python", "python2", "python3", "perl",
@@ -85,6 +88,32 @@ const SHELLS: &[&str] = &[
 const SHELL_COMMANDS: &[&str] = &["sh", "bash", "zsh", "dash", "ksh", "csh", "tcsh"];
 thread_local! {
     static SCRIPT_ANALYSIS_DEPTH: Cell<u8> = const { Cell::new(0) };
+}
+// Bounds native recursion through parse_chain_at -> parse -> unwrap ->
+// parse_chain_at (e.g. `eval eval eval ...`). Without it, deeply nested
+// wrappers overflow the stack during analysis. Fail closed: once the
+// budget is exhausted, return an unresolved command so the caller blocks.
+const MAX_PARSE_DEPTH: u32 = 24;
+thread_local! {
+    static PARSE_DEPTH: Cell<u32> = const { Cell::new(0) };
+}
+struct ParseDepthGuard;
+impl ParseDepthGuard {
+    fn enter() -> Option<Self> {
+        PARSE_DEPTH.with(|depth| {
+            let current = depth.get();
+            if current >= MAX_PARSE_DEPTH {
+                return None;
+            }
+            depth.set(current + 1);
+            Some(Self)
+        })
+    }
+}
+impl Drop for ParseDepthGuard {
+    fn drop(&mut self) {
+        PARSE_DEPTH.with(|depth| depth.set(depth.get().saturating_sub(1)));
+    }
 }
 const CRITICAL_MOUNTS: &[&str] = &[
     "/",
@@ -158,6 +187,20 @@ pub fn evaluate_at(input: &str, cwd: &Path) -> Verdict {
                 "Shell or interpreter fed from redirected stdin is prohibited",
             );
         }
+        if c.process_sub {
+            return Verdict::block(
+                "RULE_EVASION_PROCESS_SUBSTITUTION",
+                "evasion",
+                "Process substitution containing a command list cannot be analyzed safely",
+            );
+        }
+        if sed_script_unsafe(&c) {
+            return Verdict::block(
+                "RULE_EVASION_SED_SCRIPT",
+                "evasion",
+                "sed script command can execute or write arbitrary files",
+            );
+        }
         if untrusted_executable_for_root(&c) {
             return Verdict::block(
                 "RULE_EVASION_INTERPRETER_CODE",
@@ -225,7 +268,25 @@ pub fn evaluate_at(input: &str, cwd: &Path) -> Verdict {
             .or_else(|| permissions(&c))
             .or_else(|| packages(&c))
             .or_else(|| persistence(&c))
-            .or_else(|| mount(&c));
+            .or_else(|| mount(&c))
+            .or_else(|| {
+                // Globs expand at execution time to a set of paths this
+                // analysis cannot enumerate; fail closed for system-mutating
+                // commands and for mount/umount when no concrete rule
+                // already matched the glob operand.
+                if (DESTRUCTIVE.contains(&c.exe.as_str())
+                    || ["mount", "umount"].contains(&c.exe.as_str()))
+                    && has_unquoted_glob(&c.raw)
+                {
+                    Some(Verdict::block(
+                        "RULE_EVASION_UNRESOLVED_VAR",
+                        "evasion",
+                        "Glob expansion in destructive command cannot be resolved safely",
+                    ))
+                } else {
+                    None
+                }
+            });
         if let Some(v) = result {
             return v;
         }
@@ -240,6 +301,9 @@ fn split(s: &str) -> (Vec<(String, String)>, bool) {
     let cs: Vec<char> = s.chars().collect();
     let (mut out, mut cur) = (Vec::new(), String::new());
     let (mut quote, mut escape, mut depth) = (None, false, 0i32);
+    // ANSI-C ($'...') quoting: unlike plain single quotes it processes
+    // backslash escapes, so \' must not close the string.
+    let mut ansi_c = false;
     let mut op = ";".to_string();
     let mut i = 0;
     while i < cs.len() {
@@ -252,10 +316,11 @@ fn split(s: &str) -> (Vec<(String, String)>, bool) {
         }
         if quote.is_some() {
             cur.push(c);
-            if c == '\\' && quote == Some('"') {
+            if c == '\\' && (quote == Some('"') || quote == Some('`') || ansi_c) {
                 escape = true
             } else if Some(c) == quote {
-                quote = None
+                quote = None;
+                ansi_c = false;
             }
             i += 1;
             continue;
@@ -266,15 +331,34 @@ fn split(s: &str) -> (Vec<(String, String)>, bool) {
             i += 1;
             continue;
         }
-        if c == '\'' || c == '"' {
+        // Backquotes hold a full command list: keep the group inside one
+        // segment so its content can be extracted and analyzed as a chain.
+        if c == '\'' || c == '"' || c == '`' {
             quote = Some(c);
             cur.push(c);
             i += 1;
             continue;
         }
-        if c == '$' && cs.get(i + 1) == Some(&'(') {
+        if c == '$' {
+            if cs.get(i + 1) == Some(&'(') {
+                depth += 1;
+                cur.push_str("$(");
+                i += 2;
+                continue;
+            }
+            if cs.get(i + 1) == Some(&'\'') {
+                ansi_c = true;
+            }
+            cur.push(c);
+            i += 1;
+            continue;
+        }
+        // Process substitution <(...) / >(...) runs a subshell command list;
+        // it must not be split on separators like $() is not.
+        if (c == '<' || c == '>') && cs.get(i + 1) == Some(&'(') {
             depth += 1;
-            cur.push_str("$(");
+            cur.push(c);
+            cur.push('(');
             i += 2;
             continue;
         }
@@ -339,8 +423,20 @@ fn parse_chain(s: &str) -> Vec<Cmd> {
     parse_chain_at(s, Some(Path::new("/")))
 }
 fn parse_chain_at(s: &str, cwd: Option<&Path>) -> Vec<Cmd> {
-    let (segments, syntax) = split(s);
-    let syntax = syntax || contains_unsupported_compound_syntax(s);
+    let Some(_guard) = ParseDepthGuard::enter() else {
+        // Recursion budget exhausted (e.g. `eval eval eval ...`): fail closed.
+        return vec![Cmd {
+            raw: s.to_string(),
+            unresolved: true,
+            ..Cmd::default()
+        }];
+    };
+    // Bash deletes backslash-newline (line continuation) everywhere except
+    // inside single quotes and $'...'; normalize before splitting so tokens
+    // are analyzed the way bash will actually see them.
+    let s = strip_line_continuations(s);
+    let (segments, syntax) = split(&s);
+    let syntax = syntax || contains_unsupported_compound_syntax(&s);
     let mut current = cwd.map(Path::to_path_buf);
     let mut shell_env: Vec<(String, String)> = Vec::new();
     let mut mutated_paths = HashSet::new();
@@ -466,10 +562,10 @@ fn command_mutation_paths(command: &Cmd) -> Vec<String> {
         }
         "tee" => paths.extend(pos(command).into_iter().map(str::to_owned)),
         "rm" | "unlink" | "truncate" | "shred" | "chmod" | "chown" | "chgrp" | "touch" | "ln"
-        | "find" | "mkdir" | "rmdir" | "mkfifo" => {
+        | "find" | "mkdir" | "rmdir" | "mkfifo" | "chattr" | "setfacl" => {
             paths.extend(pos(command).into_iter().map(str::to_owned))
         }
-        "tar" => paths.extend(tar_archive_path(args)),
+        "tar" | "bsdtar" => paths.extend(tar_archive_path(args)),
         "cpio" => paths.extend(cpio_archive_path(args)),
         _ => {}
     }
@@ -575,11 +671,28 @@ fn link_destinations(args: &[String]) -> Vec<String> {
     if target_directory_option(args).is_some() {
         return target_directory_outputs(args);
     }
-    args.iter()
-        .filter(|arg| !arg.starts_with('-'))
-        .last()
-        .map(|path| vec![path.clone()])
-        .unwrap_or_default()
+    let operands: Vec<&String> = args.iter().filter(|arg| !arg.starts_with('-')).collect();
+    let Some(last) = operands.last() else {
+        return Vec::new();
+    };
+    // With several operands, or whenever the final operand could be a
+    // directory at execution time, `ln SRC DIR` also creates DIR/basename(SRC).
+    // The directory check cannot rely on filesystem state (TOCTOU), so derive
+    // both interpretations unconditionally.
+    let mut destinations = vec![(*last).clone()];
+    if operands.len() >= 2 {
+        for source in &operands[..operands.len() - 1] {
+            if let Some(name) = Path::new(source.as_str()).file_name() {
+                destinations.push(
+                    Path::new(last.as_str())
+                        .join(name)
+                        .to_string_lossy()
+                        .into_owned(),
+                );
+            }
+        }
+    }
+    destinations
 }
 
 fn root_mutation_paths_safe(command: &Cmd) -> bool {
@@ -796,14 +909,18 @@ fn may_change_path_aliases(command: &Cmd) -> bool {
 
 fn archive_extraction(command: &Cmd) -> bool {
     match command.exe.as_str() {
-        "tar" => {
+        "tar" | "bsdtar" => {
             command.args.first().is_some_and(|arg| {
                 !arg.starts_with('-') && (arg.starts_with('x') || arg == "extract")
             }) || command.args.iter().any(|arg| {
                 arg == "--extract"
                     || arg == "--get"
                     || arg.starts_with('-') && arg[1..].contains('x')
-            })
+            }) || command.exe == "bsdtar"
+                && command
+                    .args
+                    .iter()
+                    .any(|arg| arg == "--to-command" || arg.starts_with("--to-command="))
         }
         "unzip" => !command
             .args
@@ -904,7 +1021,7 @@ fn has_filesystem_mutation(command: &Cmd) -> bool {
     ];
     !command.redirs.is_empty()
         || mutating.contains(&command.exe.as_str())
-        || ["tar", "unzip", "7z", "7za", "7zz", "cpio"].contains(&command.exe.as_str())
+        || ["tar", "bsdtar", "unzip", "7z", "7za", "7zz", "cpio"].contains(&command.exe.as_str())
         || command.exe == "dd" && command.args.iter().any(|arg| arg.starts_with("of="))
         || ["sed", "perl"].contains(&command.exe.as_str()) && inplace(&command.args)
         || command.inner.iter().any(has_filesystem_mutation)
@@ -917,6 +1034,18 @@ fn next_workdir(
     next_op: Option<&str>,
 ) -> Option<PathBuf> {
     if matches!(next_op, Some("|" | "|&" | "&")) {
+        return current;
+    }
+    // Wrappers run their payload in the current shell (builtin/command) or
+    // at least cannot be distinguished from doing so without executing them
+    // (exec/nohup/env): unwrap a single wrapped cd before cwd tracking.
+    if ["builtin", "command", "exec", "nohup", "env"].contains(&command.exe.as_str())
+        && command.inner.len() == 1
+    {
+        let inner = &command.inner[0];
+        if ["cd", "pushd", "popd"].contains(&inner.exe.as_str()) {
+            return next_workdir(inner, current, segment_op, next_op);
+        }
         return current;
     }
     if !["cd", "pushd", "popd"].contains(&command.exe.as_str()) {
@@ -999,7 +1128,8 @@ fn has_relative_mutation(command: &Cmd) -> bool {
     }
     let mutating = [
         "rm", "unlink", "mv", "cp", "install", "tee", "truncate", "shred", "chmod", "chown",
-        "chgrp", "touch", "ln", "find", "mount", "umount", "mkdir", "rmdir", "mkfifo",
+        "chgrp", "touch", "ln", "find", "mount", "umount", "mkdir", "rmdir", "mkfifo", "chattr",
+        "setfacl",
     ];
     if mutating.contains(&command.exe.as_str()) {
         let mut operands = false;
@@ -1036,13 +1166,547 @@ fn join_quoted(args: &[String]) -> String {
         .collect::<Vec<_>>()
         .join(" ")
 }
+/// Removes backslash-newline pairs the way bash does during tokenization:
+/// everywhere except inside single quotes (literal) and inside `$'...'`
+/// (where the pair stays literal too). Comments are skipped so that a
+/// backslash-newline inside one cannot hide a command on the next line.
+fn strip_line_continuations(s: &str) -> String {
+    let cs: Vec<char> = s.chars().collect();
+    let mut out = String::with_capacity(s.len());
+    #[derive(PartialEq)]
+    enum State {
+        Plain,
+        Single,
+        AnsiC,
+        Double,
+        Comment,
+    }
+    let mut state = State::Plain;
+    let mut i = 0;
+    while i < cs.len() {
+        let c = cs[i];
+        match state {
+            State::Comment => {
+                out.push(c);
+                if c == '\n' {
+                    state = State::Plain;
+                }
+                i += 1;
+            }
+            State::Single => {
+                out.push(c);
+                if c == '\'' {
+                    state = State::Plain;
+                }
+                i += 1;
+            }
+            State::AnsiC => {
+                if c == '\\' && i + 1 < cs.len() {
+                    out.push(c);
+                    out.push(cs[i + 1]);
+                    i += 2;
+                    continue;
+                }
+                out.push(c);
+                if c == '\'' {
+                    state = State::Plain;
+                }
+                i += 1;
+            }
+            State::Double => {
+                if c == '\\' {
+                    if let Some(&n) = cs.get(i + 1) {
+                        if n == '\n' {
+                            i += 2; // line continuation: drop both chars
+                            continue;
+                        }
+                        out.push(c);
+                        out.push(n);
+                        i += 2;
+                        continue;
+                    }
+                }
+                out.push(c);
+                if c == '"' {
+                    state = State::Plain;
+                }
+                i += 1;
+            }
+            State::Plain => match c {
+                '#' if i == 0 || matches!(cs[i - 1], ' ' | '\t' | '\n' | ';' | '|' | '&' | '(') => {
+                    state = State::Comment;
+                    out.push(c);
+                    i += 1;
+                }
+                '\'' => {
+                    state = State::Single;
+                    out.push(c);
+                    i += 1;
+                }
+                '"' => {
+                    state = State::Double;
+                    out.push(c);
+                    i += 1;
+                }
+                '$' if cs.get(i + 1) == Some(&'\'') => {
+                    state = State::AnsiC;
+                    out.push(c);
+                    out.push('\'');
+                    i += 2;
+                }
+                '\\' => {
+                    match cs.get(i + 1) {
+                        Some('\n') => i += 2, // line continuation: drop both
+                        Some(&n) => {
+                            out.push(c);
+                            out.push(n);
+                            i += 2;
+                        }
+                        None => {
+                            out.push(c);
+                            i += 1;
+                        }
+                    }
+                }
+                _ => {
+                    out.push(c);
+                    i += 1;
+                }
+            },
+        }
+    }
+    out
+}
+/// True when the input contains an unquoted, unescaped glob character
+/// (`*`, `?`, `[`) that bash would expand against the filesystem.
+fn has_unquoted_glob(s: &str) -> bool {
+    let cs: Vec<char> = s.chars().collect();
+    let (mut quote, mut escape) = (None, false);
+    let mut comment = false;
+    let mut i = 0;
+    while i < cs.len() {
+        let c = cs[i];
+        if comment {
+            if c == '\n' {
+                comment = false;
+            }
+            i += 1;
+            continue;
+        }
+        if escape {
+            escape = false;
+            i += 1;
+            continue;
+        }
+        if quote.is_some() {
+            if c == '\\' && quote == Some('"') {
+                escape = true
+            } else if Some(c) == quote {
+                quote = None
+            }
+            i += 1;
+            continue;
+        }
+        match c {
+            '#' if i == 0 || matches!(cs[i - 1], ' ' | '\t' | '\n' | ';' | '|' | '&' | '(') => {
+                comment = true
+            }
+            '\\' => escape = true,
+            '\'' | '"' => quote = Some(c),
+            '*' | '?' | '[' => return true,
+            _ => {}
+        }
+        i += 1;
+    }
+    false
+}
+/// Process substitution `<(...)` / `>(...)` runs a full command list in a
+/// subshell. Groups that contain command separators cannot be modeled by the
+/// per-segment analyzer, so they fail closed. Balanced, separator-free groups
+/// are still handled through `extract_subs` (their payload is analyzed as its
+/// own chain). Unbalanced groups are unanalyzable as well.
+fn has_unsafe_process_substitution(s: &str) -> bool {
+    let cs: Vec<char> = s.chars().collect();
+    let (mut quote, mut escape) = (None, false);
+    let mut ansi_c = false;
+    let mut comment = false;
+    let mut i = 0;
+    while i < cs.len() {
+        let c = cs[i];
+        if comment {
+            if c == '\n' {
+                comment = false;
+            }
+            i += 1;
+            continue;
+        }
+        if escape {
+            escape = false;
+            i += 1;
+            continue;
+        }
+        if quote.is_some() {
+            if c == '\\' && (quote == Some('"') || quote == Some('`') || ansi_c) {
+                escape = true
+            } else if Some(c) == quote {
+                quote = None;
+                ansi_c = false;
+            }
+            i += 1;
+            continue;
+        }
+        match c {
+            '#' if i == 0 || matches!(cs[i - 1], ' ' | '\t' | '\n' | ';' | '|' | '&' | '(') => {
+                comment = true
+            }
+            '\\' => escape = true,
+            '\'' | '"' | '`' => quote = Some(c),
+            '$' if cs.get(i + 1) == Some(&'\'') => {
+                ansi_c = true;
+                quote = Some('\'');
+                i += 2;
+                continue;
+            }
+            '<' | '>' if cs.get(i + 1) == Some(&'(') => {
+                let mut depth = 1i32;
+                let mut j = i + 2;
+                let (mut q, mut esc) = (None, false);
+                let mut group_ansi = false;
+                let mut prev = c;
+                while j < cs.len() {
+                    let d = cs[j];
+                    if esc {
+                        esc = false;
+                        prev = d;
+                        j += 1;
+                        continue;
+                    }
+                    if q.is_some() {
+                        if d == '\\' && (q == Some('"') || group_ansi || q == Some('`')) {
+                            esc = true
+                        } else if Some(d) == q {
+                            q = None;
+                            group_ansi = false;
+                        }
+                        prev = d;
+                        j += 1;
+                        continue;
+                    }
+                    match d {
+                        '\'' | '"' | '`' => q = Some(d),
+                        '$' if cs.get(j + 1) == Some(&'\'') => {
+                            group_ansi = true;
+                            q = Some('\'');
+                            j += 2;
+                            continue;
+                        }
+                        '\\' => esc = true,
+                        '(' => depth += 1,
+                        ')' => {
+                            depth -= 1;
+                            if depth == 0 {
+                                break;
+                            }
+                        }
+                        ';' | '|' | '\n' => return true,
+                        '&' => {
+                            // `2>&1`-style fd redirects and `&>file` are not
+                            // separators; everything else (`&`, `&&`) is.
+                            if prev != '<' && prev != '>' && cs.get(j + 1) != Some(&'>') {
+                                return true;
+                            }
+                        }
+                        _ => {}
+                    }
+                    prev = d;
+                    j += 1;
+                }
+                if depth != 0 {
+                    // Unterminated group: cannot be analyzed safely.
+                    return true;
+                }
+                i = j + 1;
+                continue;
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    false
+}
+/// sed scripts can execute shell commands (`e`, `s///e`) or read/write
+/// arbitrary files (`w`, `W`, `r`, `R`, `s///w FILE`); `-f`/`--file` loads an
+/// uninspectable script file. Fail closed on any of those.
+fn sed_script_unsafe(command: &Cmd) -> bool {
+    if command.exe != "sed" {
+        return false;
+    }
+    match sed_scripts(&command.args) {
+        None => true,
+        Some(scripts) => scripts
+            .iter()
+            .any(|script| sed_script_has_unsafe_command(script)),
+    }
+}
+/// Collects sed script texts from the argument list. Returns None when a
+/// script comes from `-f`/`--file` (content cannot be inspected).
+fn sed_scripts(args: &[String]) -> Option<Vec<String>> {
+    let mut scripts = Vec::new();
+    let mut positional: Vec<&str> = Vec::new();
+    let mut options_end = false;
+    let mut i = 0;
+    while i < args.len() {
+        let arg = &args[i];
+        if !options_end && arg == "--" {
+            options_end = true;
+            i += 1;
+            continue;
+        }
+        if !options_end && ["-e", "--expression"].contains(&arg.as_str()) {
+            scripts.push(args.get(i + 1)?.clone());
+            i += 2;
+            continue;
+        }
+        if let Some(expr) = arg.strip_prefix("--expression=") {
+            scripts.push(expr.to_string());
+            i += 1;
+            continue;
+        }
+        if !options_end && ["-f", "--file"].contains(&arg.as_str()) || arg.starts_with("--file=") {
+            return None;
+        }
+        if !options_end && arg.starts_with('-') && arg.len() > 1 {
+            let mut chars = arg[1..].chars();
+            let mut consumed_next = false;
+            loop {
+                let Some(opt) = chars.next() else { break };
+                match opt {
+                    'e' => {
+                        let rest: String = chars.collect();
+                        if rest.is_empty() {
+                            scripts.push(args.get(i + 1)?.clone());
+                            consumed_next = true;
+                        } else {
+                            scripts.push(rest);
+                        }
+                        break;
+                    }
+                    'f' => return None,
+                    'i' | 'l' => {
+                        // Optional attached suffix / line length; GNU sed
+                        // also accepts the value as the next argument when it
+                        // is purely numeric.
+                        let rest: String = chars.collect();
+                        if rest.is_empty()
+                            && let Some(next) = args.get(i + 1)
+                            && !next.is_empty()
+                            && next.chars().all(|c| c.is_ascii_digit())
+                        {
+                            consumed_next = true;
+                        }
+                        break;
+                    }
+                    _ => {}
+                }
+            }
+            i += 1 + usize::from(consumed_next);
+            continue;
+        }
+        positional.push(arg);
+        i += 1;
+    }
+    if scripts.is_empty() && !positional.is_empty() {
+        scripts.push(positional[0].to_string());
+    }
+    Some(scripts)
+}
+/// Scans a sed script for commands that execute or write files.
+fn sed_script_has_unsafe_command(script: &str) -> bool {
+    let cs: Vec<char> = script.chars().collect();
+    let (mut i, mut start) = (0, 0);
+    while i < cs.len() {
+        let c = cs[i];
+        if i == start && c == '#' {
+            while i < cs.len() && cs[i] != '\n' {
+                i += 1;
+            }
+            if i < cs.len() {
+                i += 1;
+            }
+            start = i;
+            continue;
+        }
+        if c == ';' || c == '\n' {
+            if sed_command_is_unsafe(&cs[start..i]) {
+                return true;
+            }
+            i += 1;
+            start = i;
+            continue;
+        }
+        // Consume `s`/`y` bodies as units so delimiters like `;` inside them
+        // do not look like command separators.
+        if (c == 's' || c == 'y')
+            && cs[start..i].iter().all(|ch| ch.is_whitespace())
+            && let Some(&delim) = cs.get(i + 1)
+            && !delim.is_alphanumeric()
+            && !delim.is_whitespace()
+            && !matches!(delim, '\\' | ';' | '{' | '}')
+        {
+            let mut j = i + 2;
+            let mut remaining = 2;
+            while j < cs.len() && remaining > 0 {
+                if cs[j] == '\\' && j + 1 < cs.len() {
+                    j += 2;
+                    continue;
+                }
+                if cs[j] == delim {
+                    remaining -= 1;
+                }
+                j += 1;
+            }
+            if remaining > 0 {
+                // Unterminated s/y body: runs to the end of the script.
+                return sed_command_is_unsafe(&cs[start..]);
+            }
+            while j < cs.len() && cs[j] != ';' && cs[j] != '\n' {
+                j += 1;
+            }
+            if sed_command_is_unsafe(&cs[start..j]) {
+                return true;
+            }
+            i = j;
+            start = j;
+            continue;
+        }
+        i += 1;
+    }
+    start < cs.len() && sed_command_is_unsafe(&cs[start..])
+}
+fn sed_command_is_unsafe(command: &[char]) -> bool {
+    let text: String = command.iter().collect();
+    let mut rest = sed_strip_address(text.trim_start());
+    while let Some('{') = rest.chars().next() {
+        rest = sed_strip_address(rest[1..].trim_start());
+    }
+    let Some(op) = rest.chars().next() else {
+        return false;
+    };
+    if matches!(op, 'e' | 'w' | 'W' | 'r' | 'R') {
+        return true;
+    }
+    if op == 's' {
+        return sed_substitution_flags_unsafe(rest);
+    }
+    false
+}
+/// Checks the flags of an `s` command for `e` (execute) / `w`/`W` (write file).
+fn sed_substitution_flags_unsafe(command: &str) -> bool {
+    let cs: Vec<char> = command.chars().collect();
+    let Some(&delim) = cs.get(1) else {
+        return false;
+    };
+    if delim.is_alphanumeric() || delim.is_whitespace() || matches!(delim, '\\' | ';' | '{' | '}') {
+        return false;
+    }
+    let (mut j, mut remaining) = (2usize, 2i32);
+    while j < cs.len() && remaining > 0 {
+        if cs[j] == '\\' && j + 1 < cs.len() {
+            j += 2;
+            continue;
+        }
+        if cs[j] == delim {
+            remaining -= 1;
+        }
+        j += 1;
+    }
+    if remaining > 0 {
+        return false;
+    }
+    while j < cs.len() {
+        let flag = cs[j];
+        if matches!(flag, 'e' | 'w' | 'W') {
+            return true;
+        }
+        if flag.is_ascii_digit() || "gpiImM".contains(flag) {
+            j += 1;
+            continue;
+        }
+        break;
+    }
+    false
+}
+/// Strips a leading sed address (`N`, `$`, `/re/`, `\cREc`, ranges with `,`
+/// or `~`, and `!` negation) so the command letter is exposed.
+fn sed_strip_address(command: &str) -> &str {
+    let mut rest = command;
+    'outer: loop {
+        let Some(first) = rest.chars().next() else {
+            return rest;
+        };
+        if first.is_ascii_digit() {
+            rest = rest.trim_start_matches(|c: char| c.is_ascii_digit());
+        } else if first == '$' {
+            rest = &rest[1..];
+        } else if first == '/' {
+            let Some(end) = find_unescaped_byte(rest.as_bytes(), 1, b'/') else {
+                return rest;
+            };
+            rest = &rest[end + 1..];
+        } else if first == '\\' {
+            let bytes = rest.as_bytes();
+            if bytes.len() < 2 {
+                return rest;
+            }
+            let delim = bytes[1];
+            let Some(end) = find_unescaped_byte(bytes, 2, delim) else {
+                return rest;
+            };
+            rest = &rest[end + 1..];
+        } else if first == '!' {
+            rest = &rest[1..];
+            continue 'outer;
+        } else {
+            return rest;
+        }
+        match rest.chars().next() {
+            Some(',') | Some('~') => {
+                rest = &rest[1..];
+                continue 'outer;
+            }
+            Some('!') => {
+                rest = &rest[1..];
+                continue 'outer;
+            }
+            _ => return rest,
+        }
+    }
+}
+fn find_unescaped_byte(bytes: &[u8], from: usize, target: u8) -> Option<usize> {
+    let mut i = from;
+    while i < bytes.len() {
+        if bytes[i] == b'\\' {
+            i += 2;
+            continue;
+        }
+        if bytes[i] == target {
+            return Some(i);
+        }
+        i += 1;
+    }
+    None
+}
 fn lex(s: &str) -> (Vec<String>, bool) {
+    let cs: Vec<char> = s.chars().collect();
     let (mut out, mut word) = (Vec::new(), String::new());
     let (mut q, mut esc) = (None, false);
-    for ch in s.chars() {
+    let mut i = 0;
+    while i < cs.len() {
+        let ch = cs[i];
         if esc {
             word.push(ch);
             esc = false;
+            i += 1;
             continue;
         }
         if q.is_some() {
@@ -1053,18 +1717,38 @@ fn lex(s: &str) -> (Vec<String>, bool) {
             } else {
                 word.push(ch)
             }
+            i += 1;
             continue;
         }
         match ch {
             '\\' => esc = true,
             '\'' | '"' => q = Some(ch),
-            c if c.is_whitespace() => {
+            '$' if cs.get(i + 1) == Some(&'\'') => {
+                // ANSI-C quoting: decode escape sequences ($'\x2f' etc.) into
+                // the token so path/argument matchers see the real value.
+                let (decoded, consumed, closed) = decode_ansi_c(&cs[i + 2..]);
+                word.push_str(&decoded);
+                if !closed {
+                    return (out, true);
+                }
+                // Skip $, the opening quote, the body, and the closing quote.
+                i += 2 + consumed + 1;
+                continue;
+            }
+            '$' if cs.get(i + 1) == Some(&'"') => {
+                // Locale quoting behaves like double quotes; the $ is dropped.
+                q = Some('"');
+                i += 2;
+                continue;
+            }
+            ch if ch.is_whitespace() => {
                 if !word.is_empty() {
                     out.push(std::mem::take(&mut word))
                 }
             }
             _ => word.push(ch),
         }
+        i += 1;
     }
     let err = q.is_some() || esc;
     if !word.is_empty() {
@@ -1072,7 +1756,125 @@ fn lex(s: &str) -> (Vec<String>, bool) {
     }
     (out, err)
 }
+
+/// Decodes the body of a `$'...'` ANSI-C quoted string starting just after the
+/// opening quote. Returns the decoded value, the number of chars consumed, and
+/// whether a closing quote was found.
+fn decode_ansi_c(cs: &[char]) -> (String, usize, bool) {
+    fn hex_value(c: char) -> Option<u32> {
+        c.to_digit(16)
+    }
+    let mut out = String::new();
+    let mut i = 0;
+    while i < cs.len() {
+        let c = cs[i];
+        if c == '\'' {
+            return (out, i, true);
+        }
+        if c != '\\' {
+            out.push(c);
+            i += 1;
+            continue;
+        }
+        let Some(&e) = cs.get(i + 1) else {
+            out.push('\\');
+            i += 1;
+            continue;
+        };
+        i += 2;
+        match e {
+            'a' => out.push('\u{07}'),
+            'b' => out.push('\u{08}'),
+            'e' | 'E' => out.push('\u{1b}'),
+            'f' => out.push('\u{0c}'),
+            'n' => out.push('\n'),
+            'r' => out.push('\r'),
+            't' => out.push('\t'),
+            'v' => out.push('\u{0b}'),
+            '\\' => out.push('\\'),
+            '\'' => out.push('\''),
+            '"' => out.push('"'),
+            '?' => out.push('?'),
+            'c' => {
+                // \cX control character; \c followed by newline ends the word.
+                match cs.get(i) {
+                    Some(&x) if x == '\n' => return (out, i + 1, true),
+                    Some(&x) => {
+                        i += 1;
+                        let code = (x as u32) & 0x1f;
+                        out.push(char::from_u32(code).unwrap_or(x));
+                    }
+                    None => {
+                        out.push('\\');
+                        out.push('c');
+                    }
+                }
+            }
+            'x' => {
+                let mut digits = 0;
+                let mut value = 0u32;
+                while digits < 2
+                    && let Some(d) = cs.get(i + digits).and_then(|c| hex_value(*c))
+                {
+                    value = value * 16 + d;
+                    digits += 1;
+                }
+                if digits == 0 {
+                    out.push('\\');
+                    out.push('x');
+                } else {
+                    i += digits;
+                    out.push(char::from_u32(value).unwrap_or('\u{fffd}'));
+                }
+            }
+            'u' | 'U' => {
+                let limit = if e == 'u' { 4 } else { 8 };
+                let mut digits = 0;
+                let mut value = 0u32;
+                while digits < limit
+                    && let Some(d) = cs.get(i + digits).and_then(|c| hex_value(*c))
+                {
+                    value = value * 16 + d;
+                    digits += 1;
+                }
+                if digits == 0 {
+                    out.push('\\');
+                    out.push(e);
+                } else {
+                    i += digits;
+                    out.push(char::from_u32(value).unwrap_or('\u{fffd}'));
+                }
+            }
+            '0'..='7' => {
+                let mut digits = 1;
+                let mut value = e.to_digit(8).unwrap();
+                while digits < 3
+                    && let Some(&d) = cs.get(i + digits).filter(|c| ('0'..='7').contains(c))
+                {
+                    value = value * 8 + d.to_digit(8).unwrap();
+                    digits += 1;
+                }
+                i += digits - 1;
+                out.push(char::from_u32(value).unwrap_or('\u{fffd}'));
+            }
+            // Backslash-newline inside $'...' is not a line continuation in
+            // bash: both characters stay in the value.
+            '\n' => {
+                out.push('\\');
+                out.push('\n');
+            }
+            other => {
+                out.push('\\');
+                out.push(other);
+            }
+        }
+    }
+    (out, i, false)
+}
 fn parse(raw: &str, cwd: Option<&Path>) -> Cmd {
+    // Idempotent re-normalization for direct callers (segments arriving here
+    // from parse_chain_at are already normalized).
+    let raw = &strip_line_continuations(raw);
     let (tokens, syntax) = lex(raw);
     let mut vals = Vec::new();
     let mut redirs = Vec::new();
@@ -1180,13 +1982,15 @@ fn parse(raw: &str, cwd: Option<&Path>) -> Cmd {
         external: false,
         script_checked: false,
         cwd: cwd.map(Path::to_path_buf),
+        process_sub: has_unsafe_process_substitution(raw),
     };
     unwrap(&mut c, 0);
     c
 }
+static VAR_PATTERN: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"\$(?:\{([A-Za-z0-9_]+)\}|([A-Za-z0-9_]+))").unwrap());
 fn substitute_vars(input: &str, env: &[(String, String)]) -> String {
-    let pattern = Regex::new(r"\$(?:\{([A-Za-z0-9_]+)\}|([A-Za-z0-9_]+))").unwrap();
-    pattern
+    VAR_PATTERN
         .replace_all(input, |captures: &regex::Captures<'_>| {
             let key = captures
                 .get(1)
@@ -1202,52 +2006,179 @@ fn substitute_vars(input: &str, env: &[(String, String)]) -> String {
         .into_owned()
 }
 fn has_var(s: &str) -> bool {
-    Regex::new(r"\$(?:\{[A-Za-z0-9_]+\}|[A-Za-z0-9_]+)")
-        .unwrap()
-        .is_match(s)
+    VAR_PATTERN.is_match(s)
 }
 fn has_dynamic_expansion(s: &str) -> bool {
     has_var(s) || s.contains("$(") || s.contains('`')
 }
 fn extract_subs(s: &str) -> Vec<String> {
+    let cs: Vec<char> = s.chars().collect();
     let mut out = Vec::new();
-    for p in ["$(", "<(", ">("] {
+    // Parenthesized groups $(...) <(...) >(...): scan quote-aware so that a
+    // paren inside a quoted string cannot truncate the extracted command.
+    for needle in ["$(", "<(", ">("] {
+        let needle_len = needle.chars().count();
         let mut at = 0;
-        while let Some(i) = s[at..].find(p) {
-            let i = at + i;
-            let mut j = i + p.len();
-            let mut d = 1;
-            let b = s.as_bytes();
-            while j < b.len() && d > 0 {
-                if b[j] == b'(' {
-                    d += 1
-                } else if b[j] == b')' {
-                    d -= 1
+        while let Some(rel) = find_unquoted(&cs, needle, at) {
+            let i = rel + needle_len - 1; // index of '('
+            let mut d = 1i32;
+            let mut j = i + 1;
+            let (mut q, mut esc, mut ansi_c) = (None, false, false);
+            while j < cs.len() && d > 0 {
+                let c = cs[j];
+                if esc {
+                    esc = false;
+                    j += 1;
+                    continue;
                 }
-                j += 1
+                if q.is_some() {
+                    if c == '\\' && (q == Some('"') || q == Some('`') || ansi_c) {
+                        esc = true
+                    } else if Some(c) == q {
+                        q = None;
+                        ansi_c = false;
+                    }
+                    j += 1;
+                    continue;
+                }
+                match c {
+                    '\'' | '"' | '`' => q = Some(c),
+                    '$' if cs.get(j + 1) == Some(&'\'') => {
+                        ansi_c = true;
+                        q = Some('\'');
+                        j += 2;
+                        continue;
+                    }
+                    '\\' => esc = true,
+                    '(' => d += 1,
+                    ')' => d -= 1,
+                    _ => {}
+                }
+                j += 1;
             }
             if d == 0 {
-                out.push(s[i + p.len()..j - 1].into())
+                out.push(cs[i + 1..j - 1].iter().collect());
+                at = j;
+            } else {
+                at = i + 1;
             }
-            at = j.max(i + p.len());
-            if at >= s.len() {
+            if at >= cs.len() {
                 break;
             }
         }
     }
-    let mut rest = s;
-    while let Some(i) = rest.find('`') {
-        let x = &rest[i + 1..];
-        if let Some(j) = x.find('`') {
-            if j > 0 {
-                out.push(x[..j].into())
+    // Backquotes: the content is a command list. Quoted backticks are literal.
+    let mut at = 0;
+    while let Some(rel) = find_unquoted(&cs, "`", at) {
+        let mut j = rel + 1;
+        let (mut q, mut esc, mut ansi_c) = (None, false, false);
+        let mut closed = false;
+        while j < cs.len() {
+            let c = cs[j];
+            if esc {
+                esc = false;
+                j += 1;
+                continue;
             }
-            rest = &x[j + 1..]
+            if q.is_some() {
+                if c == '\\' && (q == Some('"') || q == Some('`') || ansi_c) {
+                    esc = true
+                } else if Some(c) == q {
+                    q = None;
+                    ansi_c = false;
+                }
+                j += 1;
+                continue;
+            }
+            match c {
+                '\'' | '"' => q = Some(c),
+                '$' if cs.get(j + 1) == Some(&'\'') => {
+                    ansi_c = true;
+                    q = Some('\'');
+                    j += 2;
+                    continue;
+                }
+                '\\' => esc = true,
+                '`' => {
+                    closed = true;
+                    break;
+                }
+                _ => {}
+            }
+            j += 1;
+        }
+        if closed {
+            if j > rel + 1 {
+                out.push(cs[rel + 1..j].iter().collect());
+            }
+            at = j + 1;
         } else {
+            break;
+        }
+        if at >= cs.len() {
             break;
         }
     }
     out
+}
+
+/// Finds `needle` in `cs` starting at `from`, ignoring occurrences inside
+/// quotes, comments, or after a backslash escape. `needle` is one or two
+/// chars; returns the index of its first char.
+fn find_unquoted(cs: &[char], needle: &str, from: usize) -> Option<usize> {
+    let needle: Vec<char> = needle.chars().collect();
+    let (mut quote, mut escape) = (None, false);
+    let mut ansi_c = false;
+    let mut comment = false;
+    let mut i = 0;
+    while i < cs.len() {
+        let c = cs[i];
+        if comment {
+            if c == '\n' {
+                comment = false;
+            }
+            i += 1;
+            continue;
+        }
+        if escape {
+            escape = false;
+            i += 1;
+            continue;
+        }
+        if quote.is_some() {
+            if c == '\\' && (quote == Some('"') || quote == Some('`') || ansi_c) {
+                escape = true
+            } else if Some(c) == quote {
+                quote = None;
+                ansi_c = false;
+            }
+            i += 1;
+            continue;
+        }
+        if c == '\\' {
+            escape = true;
+            i += 1;
+            continue;
+        }
+        if i >= from && cs[i..].starts_with(&needle[..]) {
+            return Some(i);
+        }
+        match c {
+            '#' if i == 0 || matches!(cs[i - 1], ' ' | '\t' | '\n' | ';' | '|' | '&' | '(') => {
+                comment = true
+            }
+            '\'' | '"' | '`' => quote = Some(c),
+            '$' if cs.get(i + 1) == Some(&'\'') => {
+                ansi_c = true;
+                quote = Some('\'');
+                i += 2;
+                continue;
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    None
 }
 fn unwrap(c: &mut Cmd, depth: u8) {
     if depth > 10 {
@@ -2363,6 +3294,9 @@ fn wrapper_option_attached(exe: &str, arg: &str) -> bool {
         _ => false,
     }
 }
+static FORK_BOMB_PATTERN: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"(?s)(?:function\s+)?(\w+)\s*(?:\(\s*\))?\s*\{([^}]*)\}\s*;\s*(\w+)").unwrap()
+});
 fn fork_bomb(s: &str) -> bool {
     let compact = s.chars().filter(|c| !c.is_whitespace()).collect::<String>();
     let lower = compact.to_lowercase();
@@ -2377,9 +3311,7 @@ fn fork_bomb(s: &str) -> bool {
     {
         return true;
     }
-    let re =
-        Regex::new(r"(?s)(?:function\s+)?(\w+)\s*(?:\(\s*\))?\s*\{([^}]*)\}\s*;\s*(\w+)").unwrap();
-    re.captures(s).is_some_and(|c| {
+    FORK_BOMB_PATTERN.captures(s).is_some_and(|c| {
         c.get(1).unwrap().as_str() == c.get(3).unwrap().as_str()
             && c[2].contains('|')
             && c[2].contains('&')
@@ -2619,7 +3551,7 @@ fn auth(c: &Cmd) -> Option<Verdict> {
     }
     if [
         "rm", "unlink", "truncate", "chmod", "chown", "chgrp", "mv", "cp", "install", "tee",
-        "touch", "shred", "ln",
+        "touch", "shred", "ln", "setfacl",
     ]
     .contains(&c.exe.as_str())
     {
@@ -2658,6 +3590,18 @@ fn auth(c: &Cmd) -> Option<Verdict> {
             "RULE_AUTH_FILE_MUTATION",
             "auth",
             "Archive output to a critical authentication asset is blocked",
+        );
+    }
+    if c.exe == "dd"
+        && c.args.iter().any(|x| {
+            x.strip_prefix("of=")
+                .is_some_and(|target| auth_match(target, c.cwd.as_deref()))
+        })
+    {
+        return result(
+            "RULE_AUTH_FILE_MUTATION",
+            "auth",
+            "Raw write to critical authentication asset blocked",
         );
     }
     if c.exe == "find"
@@ -3097,11 +4041,15 @@ fn storage(c: &Cmd) -> Option<Verdict> {
             "Destructive operation on critical mountpoint blocked",
         );
     }
-    let dest = if ["tar", "unzip"].contains(&c.exe.as_str()) {
-        let fl = if c.exe == "tar" { "-C" } else { "-d" };
+    let dest = if ["tar", "bsdtar"].contains(&c.exe.as_str()) {
         c.args
             .windows(2)
-            .find(|w| w[0] == fl)
+            .find(|w| w[0] == "-C")
+            .map(|w| w[1].as_str())
+    } else if c.exe == "unzip" {
+        c.args
+            .windows(2)
+            .find(|w| w[0] == "-d")
             .map(|w| w[1].as_str())
     } else if c.exe == "rsync" {
         pos(c).last().copied()
@@ -3340,11 +4288,11 @@ fn boot_config_path(s: &str, cwd: Option<&Path>) -> bool {
         .iter()
         .any(|n| boot_config_path_normalized(n))
 }
+static GRUB_CONFIG_PATTERN: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"^/boot/grub[^/]*/grub\.cfg$").unwrap());
 fn boot_config_path_normalized(n: &str) -> bool {
     ["/etc/fstab", "/etc/default/grub", "/etc/kernel/cmdline"].contains(&n)
-        || Regex::new(r"^/boot/grub[^/]*/grub\.cfg$")
-            .unwrap()
-            .is_match(&n)
+        || GRUB_CONFIG_PATTERN.is_match(&n)
 }
 fn boot_config(c: &Cmd) -> Option<Verdict> {
     const RULE: &str = "RULE_BOOT_CONFIG_INTEGRITY";
@@ -3628,6 +4576,18 @@ fn process(c: &Cmd) -> Option<Verdict> {
     }
     None
 }
+static CHMOD_CRIPPLE_PATTERN: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"^[ugoa]*-[rwxXst]+$").unwrap());
+static SYSTEM_BINARY_PATTERN: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"^/(usr/)?(bin|sbin|lib|lib64)/[^/]+$").unwrap());
+static OCTAL_MODE_PATTERN: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"^[0-7]{3,4}$").unwrap());
+static SYMBOLIC_MODE_PATTERN: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"^[ugoa]*[=+-][rwxXst]+$").unwrap());
+static SYMBOLIC_MODE_NEGATE_PATTERN: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"[ugoa]*-[rwxXst]+").unwrap());
+// `=` sets the exact attribute set (chattr =ia includes immutable).
+static CHATTR_IMMUTABLE_PATTERN: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"^[=+-][a-zA-Z]*i[a-zA-Z]*$").unwrap());
 fn permissions(c: &Cmd) -> Option<Verdict> {
     const R: &str = "RULE_RECURSIVE_PERM_CHANGE";
     let critical = [
@@ -3653,7 +4613,7 @@ fn permissions(c: &Cmd) -> Option<Verdict> {
         .filter(|x| !x.starts_with('-'))
         .map(|x| absnorm(x, c.cwd.as_deref()))
         .collect();
-    if ["chmod", "chown", "chgrp"].contains(&c.exe.as_str())
+    if ["chmod", "chown", "chgrp", "setfacl"].contains(&c.exe.as_str())
         && recursive(&c.args)
         && paths
             .iter()
@@ -3666,9 +4626,10 @@ fn permissions(c: &Cmd) -> Option<Verdict> {
         );
     }
     if c.exe == "chmod" {
-        let cripple = c.args.iter().any(|x| {
-            x == "000" || x == "0000" || Regex::new(r"^[ugoa]*-[rwxXst]+$").unwrap().is_match(x)
-        });
+        let cripple = c
+            .args
+            .iter()
+            .any(|x| x == "000" || x == "0000" || CHMOD_CRIPPLE_PATTERN.is_match(x));
         if paths.iter().any(|p| critical.contains(&p.as_str())) && cripple {
             return result(
                 R,
@@ -3676,18 +4637,19 @@ fn permissions(c: &Cmd) -> Option<Verdict> {
                 "Refusing to cripple critical directory permissions",
             );
         }
-        let bin = Regex::new(r"^/(usr/)?(bin|sbin|lib|lib64)/[^/]+$").unwrap();
         let mode = |x: &str| {
-            if Regex::new(r"^[0-7]{3,4}$").unwrap().is_match(x) {
+            if OCTAL_MODE_PATTERN.is_match(x) {
                 u32::from_str_radix(x, 8)
                     .ok()
                     .is_some_and(|v| v & 0o111 == 0)
             } else {
-                Regex::new(r"^[ugoa]*[=+-][rwxXst]+$").unwrap().is_match(x)
-                    && (!x.contains('x') || Regex::new(r"[ugoa]*-[rwxXst]+").unwrap().is_match(x))
+                SYMBOLIC_MODE_PATTERN.is_match(x)
+                    && (!x.contains('x') || SYMBOLIC_MODE_NEGATE_PATTERN.is_match(x))
             }
         };
-        if paths.iter().any(|p| bin.is_match(p)) && (cripple || c.args.iter().any(|x| mode(x))) {
+        if paths.iter().any(|p| SYSTEM_BINARY_PATTERN.is_match(p))
+            && (cripple || c.args.iter().any(|x| mode(x)))
+        {
             return result(
                 R,
                 "recursive_perm",
@@ -3696,19 +4658,13 @@ fn permissions(c: &Cmd) -> Option<Verdict> {
         }
     }
     if c.exe == "chattr"
-        && c.args.iter().any(|x| {
-            Regex::new(r"^[+-][a-zA-Z]*i[a-zA-Z]*$")
-                .unwrap()
-                .is_match(x)
-        })
+        && c.args.iter().any(|x| CHATTR_IMMUTABLE_PATTERN.is_match(x))
         && paths.iter().any(|p| {
             critical.contains(&p.as_str())
                 || ["/etc/", "/boot/", "/usr/lib/systemd/"]
                     .iter()
                     .any(|r| p.starts_with(r))
-                || Regex::new(r"^/(usr/)?(bin|sbin|lib|lib64)/[^/]+$")
-                    .unwrap()
-                    .is_match(p)
+                || SYSTEM_BINARY_PATTERN.is_match(p)
         })
     {
         return result(
@@ -3719,6 +4675,9 @@ fn permissions(c: &Cmd) -> Option<Verdict> {
     }
     None
 }
+static PROTECTED_PACKAGE_PATTERN: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"^(systemd|glibc|dnf|rpm|bash|coreutils|sudo|filesystem)(-\d.*)?$").unwrap()
+});
 fn packages(c: &Cmd) -> Option<Verdict> {
     const R: &str = "RULE_PACKAGE_STATE_DESTRUCTION";
     let a = &c.args;
@@ -3754,15 +4713,13 @@ fn packages(c: &Cmd) -> Option<Verdict> {
         || ["apt", "apt-get"].contains(&c.exe.as_str())
             && a.iter().any(|x| x == "remove" || x == "purge");
     if removal {
-        let exact = Regex::new(r"^(systemd|glibc|dnf|rpm|bash|coreutils|sudo|filesystem)(-\d.*)?$")
-            .unwrap();
         for x in a {
             if x.starts_with('-')
                 || ["remove", "purge", "erase", "autoremove"].contains(&x.as_str())
             {
                 continue;
             }
-            if exact.is_match(x)
+            if PROTECTED_PACKAGE_PATTERN.is_match(x)
                 || ["kernel", "openssh", "python3"]
                     .iter()
                     .any(|p| x.starts_with(p))
@@ -3782,16 +4739,24 @@ fn persistence_path(s: &str, cwd: Option<&Path>) -> bool {
         .iter()
         .any(|n| persistence_path_normalized(n))
 }
+static SYSTEMD_UNIT_PATTERN: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"^/etc/systemd/system/[^/]+\.(service|timer)$").unwrap());
+static CRON_D_PATTERN: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"^/etc/cron\.d/[^/]+$").unwrap());
+static PROFILE_D_PATTERN: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"^/etc/profile\.d/[^/]+$").unwrap());
+static PROTECTED_LOG_PATTERN: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"^/var/log/(auth\.log|secure|messages|syslog|wtmp|btmp|audit\.log)(\.\d+)?(\.gz)?$")
+        .unwrap()
+});
 fn persistence_path_normalized(n: &str) -> bool {
     if n == "/etc/systemd/system/agent-root-runner.service" {
         return false;
     }
     if n.starts_with("/usr/lib/systemd/system/")
-        || Regex::new(r"^/etc/systemd/system/[^/]+\.(service|timer)$")
-            .unwrap()
-            .is_match(&n)
-        || Regex::new(r"^/etc/cron\.d/[^/]+$").unwrap().is_match(&n)
-        || Regex::new(r"^/etc/profile\.d/[^/]+$").unwrap().is_match(&n)
+        || SYSTEMD_UNIT_PATTERN.is_match(&n)
+        || CRON_D_PATTERN.is_match(&n)
+        || PROFILE_D_PATTERN.is_match(&n)
         || n == "/var/spool/cron"
         || n.starts_with("/var/spool/cron/")
     {
@@ -3811,11 +4776,7 @@ fn persistence_path_normalized(n: &str) -> bool {
     {
         return true;
     }
-    let log = Regex::new(
-        r"^/var/log/(auth\.log|secure|messages|syslog|wtmp|btmp|audit\.log)(\.\d+)?(\.gz)?$",
-    )
-    .unwrap();
-    log.is_match(&n)
+    PROTECTED_LOG_PATTERN.is_match(&n)
         || n.starts_with("/var/log/audit/")
         || n.starts_with("/var/log/agent-root-runner/")
 }
@@ -3867,7 +4828,7 @@ fn persistence(c: &Cmd) -> Option<Verdict> {
     let mut cand = c.redirs.clone();
     if [
         "rm", "unlink", "mv", "cp", "install", "tee", "truncate", "shred", "chmod", "chown",
-        "touch", "ln",
+        "touch", "ln", "chattr", "setfacl",
     ]
     .contains(&c.exe.as_str())
         || ["sed", "perl"].contains(&c.exe.as_str()) && inplace(&c.args)
@@ -3878,6 +4839,19 @@ fn persistence(c: &Cmd) -> Option<Verdict> {
                 .filter(|x| !x.starts_with('-') && !x.contains('='))
                 .cloned(),
         )
+    }
+    // `ln SRC DIR` can also create DIR/basename(SRC) when DIR is (or becomes)
+    // a directory; the derived candidates must be checked too.
+    if c.exe == "ln" {
+        cand.extend(link_destinations(&c.args));
+    }
+    // dd of=FILE writes raw data into the target file.
+    if c.exe == "dd" {
+        cand.extend(
+            c.args
+                .iter()
+                .filter_map(|x| x.strip_prefix("of=").map(str::to_owned)),
+        );
     }
     if cand.iter().any(|x| persistence_path(x, c.cwd.as_deref())) {
         return result(
@@ -3942,7 +4916,10 @@ fn xargs_flow(producer: &str, xargs: &Cmd) -> bool {
             .first()
             .is_some_and(|x| critical(x, p.cwd.as_deref()));
     }
-    recursive(&inner.args)
+    // Unknown producers (`ls`, `du`, `grep -l`, ...) emit data-dependent
+    // filenames; combined with a mutating inner command the effect cannot be
+    // verified, so fail closed regardless of the inner command's flags.
+    true
 }
 
 #[cfg(test)]
@@ -5060,5 +6037,285 @@ mod tests {
         bypass_attempt.push_str("; rm -f /etc/shadow");
         let v2 = evaluate(&bypass_attempt);
         assert!(!v2.allowed, "payload after 512 segments must fail closed");
+    }
+
+    #[test]
+    fn blocks_process_substitution_command_lists() {
+        for (command, expected) in [
+            (
+                "cat /etc/hosts <(true; rm -f /etc/shadow)",
+                "RULE_EVASION_PROCESS_SUBSTITUTION",
+            ),
+            (
+                "cat /etc/hosts <(true; chmod 777 /etc/shadow)",
+                "RULE_EVASION_PROCESS_SUBSTITUTION",
+            ),
+            (
+                "cat /etc/hosts <(true; usermod -L root)",
+                "RULE_EVASION_PROCESS_SUBSTITUTION",
+            ),
+            (
+                "cat /etc/hosts <(true; kill 1)",
+                "RULE_EVASION_PROCESS_SUBSTITUTION",
+            ),
+            (
+                "ls 2>(true; dd if=/dev/zero of=/etc/shadow)",
+                "RULE_EVASION_PROCESS_SUBSTITUTION",
+            ),
+            // A quoted paren must not let the payload escape the group scan.
+            (
+                "cat /etc/hosts <(echo \"(\"; rm -f /etc/shadow; true)",
+                "RULE_EVASION_PROCESS_SUBSTITUTION",
+            ),
+            // Unbalanced process substitution is unanalyzable.
+            (
+                "cat /etc/hosts <(true; rm -f /etc/shadow",
+                "RULE_EVASION_SYNTAX_ERROR",
+            ),
+            // Backquote lists with non-destructive executables must reach the
+            // rule families through substitution extraction.
+            ("echo `true; umount /etc`", "RULE_MOUNT_INTEGRITY"),
+            ("echo `true; kill 1`", "RULE_PROCESS_INTEGRITY"),
+            (
+                "echo `true; systemctl stop NetworkManager`",
+                "RULE_NETWORK_ISOLATION",
+            ),
+        ] {
+            assert_eq!(evaluate(command).rule, Some(expected), "{command}");
+        }
+        // Separator-free groups keep flowing through extract_subs analysis.
+        assert_eq!(
+            evaluate("cat <(dd of=/dev/nvme0n1)").rule,
+            Some("RULE_BLOCK_DEV_RAW_WRITE")
+        );
+        assert!(evaluate("cat <(echo hi)").allowed);
+        assert!(evaluate("echo '`true; umount /etc`'").allowed);
+        assert!(evaluate("echo hi # <(true; rm -f /etc/shadow)").allowed);
+    }
+
+    #[test]
+    fn normalizes_bash_line_continuations() {
+        for (command, expected) in [
+            (
+                "systemctl st\\\nop NetworkManager",
+                "RULE_NETWORK_ISOLATION",
+            ),
+            ("bash -c 'rm -rf /et\\\nc'", "RULE_FS_RECURSIVE_ROOT_DELETE"),
+            ("rpm --rebuil\\\nddb", "RULE_PACKAGE_STATE_DESTRUCTION"),
+            ("nmcli networking of\\\nf", "RULE_NETWORK_ISOLATION"),
+            // A backslash-newline inside a comment does not continue it in
+            // bash: the next line is a real command and must be analyzed.
+            ("echo x # c\\\nrm -f /etc/shadow", "RULE_AUTH_FILE_MUTATION"),
+        ] {
+            assert_eq!(evaluate(command).rule, Some(expected), "{command}");
+        }
+        // Backslash-newline inside single quotes stays literal (bash keeps it).
+        assert!(evaluate("echo 'a\\\nb'").allowed);
+    }
+
+    #[test]
+    fn decodes_ansi_c_and_locale_quoting() {
+        for (command, expected) in [
+            ("umount $'/etc'", "RULE_MOUNT_INTEGRITY"),
+            ("umount $\"/etc\"", "RULE_MOUNT_INTEGRITY"),
+            ("kill $'1'", "RULE_PROCESS_INTEGRITY"),
+            ("kill $'-1'", "RULE_PROCESS_INTEGRITY"),
+            ("dnf $'remove' systemd", "RULE_PACKAGE_STATE_DESTRUCTION"),
+            ("userdel $'root'", "RULE_AUTH_FILE_MUTATION"),
+            ("crontab $'-r'", "RULE_PERSISTENCE_TAMPER"),
+            ("journalctl $'--vacuum-time=1s'", "RULE_PERSISTENCE_TAMPER"),
+            ("systemctl stop $'NetworkManager'", "RULE_NETWORK_ISOLATION"),
+            (
+                "systemctl mask $'sshd.service'",
+                "RULE_BOOT_CONFIG_INTEGRITY",
+            ),
+            (
+                "systemctl enable $'/tmp/evil.service'",
+                "RULE_PERSISTENCE_TAMPER",
+            ),
+            ("mount -o remount,rw $'/etc'", "RULE_MOUNT_INTEGRITY"),
+            ("chattr +i $'/root/.bashrc'", "RULE_PERSISTENCE_TAMPER"),
+            (
+                "rsync -a --delete /tmp/empty/ $'/etc/'",
+                "RULE_FS_RECURSIVE_ROOT_DELETE",
+            ),
+            ("ip link set $'down' dev eth0", "RULE_NETWORK_ISOLATION"),
+            ("nft $'flush' $'ruleset'", "RULE_NETWORK_ISOLATION"),
+            ("iptables $'-F'", "RULE_NETWORK_ISOLATION"),
+            // Hex escapes decode into the real path.
+            ("truncate $'\\x2fetc\\x2fshadow'", "RULE_AUTH_FILE_MUTATION"),
+            // Redirection targets are analyzed after decoding.
+            ("printf x > $'/etc/hosts'", "RULE_PERSISTENCE_TAMPER"),
+        ] {
+            assert_eq!(evaluate(command).rule, Some(expected), "{command}");
+        }
+        assert!(evaluate("echo $'hi'").allowed);
+        assert!(evaluate("printf '%s' $'a\\tb'").allowed);
+    }
+
+    #[test]
+    fn blocks_sed_scripts_that_execute_or_write_files() {
+        for (command, expected) in [
+            (
+                "sed -n 'e chmod 777 /etc/shadow' /etc/hosts",
+                "RULE_EVASION_SED_SCRIPT",
+            ),
+            ("sed 'w /etc/passwd' /etc/hosts", "RULE_EVASION_SED_SCRIPT"),
+            (
+                "echo hi | sed 's/hi/pwned/w /etc/shadow'",
+                "RULE_EVASION_SED_SCRIPT",
+            ),
+            (
+                "printf x | sed -e 'w /etc/shadow'",
+                "RULE_EVASION_SED_SCRIPT",
+            ),
+            ("sed -f /tmp/evil.sed /etc/hosts", "RULE_EVASION_SED_SCRIPT"),
+            (
+                "sed --file=/tmp/evil.sed /etc/hosts",
+                "RULE_EVASION_SED_SCRIPT",
+            ),
+            ("sed 's/a/b/e' /etc/hosts", "RULE_EVASION_SED_SCRIPT"),
+            ("sed 'r /etc/shadow' /tmp/f", "RULE_EVASION_SED_SCRIPT"),
+            (
+                "sed '/re/{w /etc/shadow}' /tmp/f",
+                "RULE_EVASION_SED_SCRIPT",
+            ),
+        ] {
+            assert_eq!(evaluate(command).rule, Some(expected), "{command}");
+        }
+        // Ordinary scripts and addresses keep working.
+        assert!(evaluate("sed -n 1,3p /etc/fstab").allowed);
+        assert!(evaluate("sed 's/a/b/' /etc/fstab").allowed);
+        assert!(evaluate("sed '1,3d; s/x/y/' /tmp/f").allowed);
+        assert!(evaluate("sed '/^#/d' /etc/fstab").allowed);
+        assert!(evaluate("sed 'y/ab/ba/' /tmp/f").allowed);
+        assert!(evaluate("sed '2~3d' /tmp/f").allowed);
+    }
+
+    #[test]
+    fn blocks_dd_output_to_auth_and_persistence_assets() {
+        for (command, expected) in [
+            (
+                "dd if=/dev/zero of=/etc/shadow bs=1 count=1 conv=notrunc",
+                "RULE_AUTH_FILE_MUTATION",
+            ),
+            ("dd if=/dev/zero of=/etc/crontab", "RULE_PERSISTENCE_TAMPER"),
+            (
+                "dd of=/root/.bashrc if=/dev/null",
+                "RULE_PERSISTENCE_TAMPER",
+            ),
+        ] {
+            assert_eq!(evaluate(command).rule, Some(expected), "{command}");
+        }
+        assert!(evaluate("dd if=/dev/zero of=/tmp/output.bin").allowed);
+    }
+
+    #[test]
+    fn tracks_cwd_through_builtin_and_command_wrappers() {
+        for (command, expected) in [
+            ("builtin cd /etc; rm -rf passwd", "RULE_AUTH_FILE_MUTATION"),
+            ("command cd /etc; rm -rf passwd", "RULE_AUTH_FILE_MUTATION"),
+            ("builtin cd /etc; rm shadow", "RULE_AUTH_FILE_MUTATION"),
+            ("command cd /etc && shred shadow", "RULE_AUTH_FILE_MUTATION"),
+        ] {
+            assert_eq!(evaluate(command).rule, Some(expected), "{command}");
+        }
+        assert!(evaluate("builtin echo hi").allowed);
+        assert!(evaluate("command true").allowed);
+        assert!(evaluate("env --chdir /tmp echo safe").allowed);
+    }
+
+    #[test]
+    fn fails_closed_on_unbounded_parse_recursion() {
+        let mut chain = String::new();
+        for _ in 0..1000 {
+            chain.push_str("eval ");
+        }
+        chain.push_str("true");
+        let v = evaluate(&chain);
+        assert!(!v.allowed, "deep eval chain must fail closed");
+        assert_eq!(v.rule, Some("RULE_EVASION_UNRESOLVED_VAR"));
+
+        let mut nested = String::from("rm -f /etc/shadow");
+        for _ in 0..60 {
+            nested = format!("bash -c '{nested}'");
+        }
+        let v = evaluate(&nested);
+        assert!(!v.allowed, "deep nested shell must fail closed");
+    }
+
+    #[test]
+    fn blocks_bsdtar_extraction_and_to_command() {
+        for (command, expected) in [
+            (
+                "bsdtar -xf /tmp/evil.tar -C /etc",
+                "RULE_EVASION_UNRESOLVED_VAR",
+            ),
+            (
+                "bsdtar -xf /tmp/evil.tar --to-command='sh -c \"rm -rf /etc\"'",
+                "RULE_EVASION_UNRESOLVED_VAR",
+            ),
+        ] {
+            assert_eq!(evaluate(command).rule, Some(expected), "{command}");
+        }
+        assert!(evaluate("bsdtar -tf /tmp/x.tar").allowed);
+        assert!(evaluate("bsdtar --list -f /tmp/x.tar").allowed);
+    }
+
+    #[test]
+    fn blocks_trailing_directory_link_outputs() {
+        for (command, expected) in [
+            ("ln -sf /tmp/evil /etc/cron.d", "RULE_PERSISTENCE_TAMPER"),
+            ("ln -sf /tmp/evil /etc/profile.d", "RULE_PERSISTENCE_TAMPER"),
+        ] {
+            assert_eq!(evaluate(command).rule, Some(expected), "{command}");
+        }
+        assert!(evaluate("ln -s /tmp/source-link /tmp/dest-link").allowed);
+    }
+
+    #[test]
+    fn blocks_chattr_setfacl_and_glob_evasion() {
+        for (command, expected) in [
+            // `=` sets the exact attribute set (includes immutable).
+            ("chattr =ia /etc/shadow", "RULE_RECURSIVE_PERM_CHANGE"),
+            // Variables in chattr operands cannot be resolved.
+            ("chattr +i ${HOME}/.bashrc", "RULE_EVASION_UNRESOLVED_VAR"),
+            // Glob operands of mount/umount cannot be enumerated.
+            ("umount /etc*", "RULE_EVASION_UNRESOLVED_VAR"),
+            ("mount /dev/sdb1 /etc*", "RULE_EVASION_UNRESOLVED_VAR"),
+            // ACL changes on auth assets are integrity-relevant.
+            (
+                "setfacl -m u:1000:rw /etc/shadow",
+                "RULE_AUTH_FILE_MUTATION",
+            ),
+            ("setfacl -b /etc/shadow", "RULE_AUTH_FILE_MUTATION"),
+            ("setfacl -R -m u:1000:rw /etc", "RULE_RECURSIVE_PERM_CHANGE"),
+        ] {
+            assert_eq!(evaluate(command).rule, Some(expected), "{command}");
+        }
+        assert!(evaluate("setfacl -m u:1000:rw /tmp/file").allowed);
+        assert!(evaluate("chattr +i /home/user/notes.txt").allowed);
+        // Read-only commands with globs stay usable.
+        assert!(evaluate("ls /etc*").allowed);
+        assert!(evaluate("echo /etc*").allowed);
+        // Quoted globs of destructive commands are literal, not expansions.
+        assert!(evaluate("find /tmp -name '*.tmp' -delete").allowed);
+    }
+
+    #[test]
+    fn blocks_xargs_pipelines_from_unverified_producers() {
+        for (command, expected) in [
+            ("ls /etc | xargs rm -f", "RULE_PIPELINE_XARGS_DATAFLOW"),
+            ("ls /etc | xargs chmod 777", "RULE_PIPELINE_XARGS_DATAFLOW"),
+        ] {
+            assert_eq!(evaluate(command).rule, Some(expected), "{command}");
+        }
+        // Producers whose output is fully known stay allowed.
+        assert!(evaluate("echo foo | xargs rm -f").allowed);
+        assert!(evaluate("echo foo | xargs echo").allowed);
+        assert_eq!(
+            evaluate("echo /etc | xargs rm -rf").rule,
+            Some("RULE_PIPELINE_XARGS_DATAFLOW")
+        );
     }
 }
