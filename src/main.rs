@@ -1064,12 +1064,7 @@ impl Daemon {
             }
         };
         if let Some(message) = rejected {
-            let reason = if message.contains("quota") {
-                "QUOTA_EXHAUSTED"
-            } else {
-                "DISARMED"
-            };
-            return rpc_error(id, -32001, message, Some(json!({"reason":reason})));
+            return admit_error(id, message);
         }
         let _exec = self.exec_lock.lock().unwrap_or_else(|e| e.into_inner());
         let rejected = match self
@@ -1087,12 +1082,7 @@ impl Daemon {
             }
         };
         if let Some(message) = rejected {
-            let reason = if message.contains("quota") {
-                "QUOTA_EXHAUSTED"
-            } else {
-                "DISARMED"
-            };
-            return rpc_error(id, -32001, message, Some(json!({"reason":reason})));
+            return admit_error(id, message);
         }
         let resolved_workdir = match self.executor.resolve_workdir(workdir) {
             Ok(directory) => directory,
@@ -1140,14 +1130,7 @@ impl Daemon {
         }
         let admission = match self.state.admit(p.pid, p.uid, p.gid, &p.comm, &command) {
             Ok(a) => a,
-            Err(e) => {
-                let reason = if e.contains("quota") {
-                    "QUOTA_EXHAUSTED"
-                } else {
-                    "DISARMED"
-                };
-                return rpc_error(id, -32001, e, Some(json!({"reason":reason})));
-            }
+            Err(e) => return admit_error(id, e),
         };
         let effective = admission
             .remaining_seconds
@@ -1286,6 +1269,22 @@ fn discard_until_newline<R: BufRead>(reader: &mut R) -> io::Result<()> {
 fn rpc_result(id: Value, result: Value) -> Value {
     json!({"jsonrpc":"2.0","id":id,"result":result})
 }
+/// Classify a state-layer admission error. Audit-latch failures and malformed
+/// parameters must not masquerade as "DISARMED": that mislabels a fail-closed
+/// daemon as merely unarmed and hides a real integrity problem from the CLI.
+fn admit_error(id: Value, message: String) -> Value {
+    let (code, reason) = if message.contains("audit") || message.contains("Audit") {
+        (-32603, "AUDIT_FAILURE")
+    } else if message.contains("quota") {
+        (-32001, "QUOTA_EXHAUSTED")
+    } else if message.starts_with("Invalid params") {
+        (-32602, "INVALID_PARAMS")
+    } else {
+        (-32001, "DISARMED")
+    };
+    rpc_error(id, code, message, Some(json!({"reason": reason})))
+}
+
 fn rpc_error(id: Value, code: i64, message: impl Into<String>, data: Option<Value>) -> Value {
     let mut error = json!({"code":code,"message":message.into()});
     if let Some(d) = data {
@@ -2142,5 +2141,37 @@ mod socket_parent_tests {
                 "admin_group must not miss an existing admin group"
             ),
         }
+    }
+
+    #[test]
+    fn admit_errors_are_classified_by_cause() {
+        let id = json!(1);
+        let audit = admit_error(
+            id.clone(),
+            "Audit logging previously failed; the daemon is fail-closed.".into(),
+        );
+        assert_eq!(audit["error"]["code"], -32603);
+        assert_eq!(audit["error"]["data"]["reason"], "AUDIT_FAILURE");
+
+        let quota = admit_error(
+            id.clone(),
+            "Execution quota exhausted. Re-arm with 'sudo agent-root-runner arm'.".into(),
+        );
+        assert_eq!(quota["error"]["code"], -32001);
+        assert_eq!(quota["error"]["data"]["reason"], "QUOTA_EXHAUSTED");
+
+        let invalid = admit_error(
+            id.clone(),
+            "Invalid params: 'command' must not be blank or contain null bytes.".into(),
+        );
+        assert_eq!(invalid["error"]["code"], -32602);
+        assert_eq!(invalid["error"]["data"]["reason"], "INVALID_PARAMS");
+
+        let disarmed = admit_error(
+            id,
+            "Service is DISARMED. Run 'sudo agent-root-runner arm' to enable.".into(),
+        );
+        assert_eq!(disarmed["error"]["code"], -32001);
+        assert_eq!(disarmed["error"]["data"]["reason"], "DISARMED");
     }
 }

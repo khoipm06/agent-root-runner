@@ -300,11 +300,13 @@ Archive extraction is denied when member destinations cannot be verified.
 | Exit Code | Semantics | JSON-RPC Code | Root Cause & Resolution |
 |:---:|---|:---:|---|
 | `0` | **Success** | — | Command completed with exit code 0. |
-| `1` | **Permission / Usage Error** | `-32003` (`PERMISSION_DENIED`) | User not in `wheel`, socket unreachable, or non-root `arm` invocation. |
+| `1` | **Permission / Usage Error** | `-32003` (`PERMISSION_DENIED`) | User not in the socket admin group (`wheel`/`sudo`/`adm`), socket unreachable, or non-root `arm` invocation. |
+| `2` | **Invalid Parameters** | `-32602` (`INVALID_PARAMS`) | Malformed request, invalid duration/quota, blank command, or unusable workdir. |
 | `124` | **Execution Timeout** | `-32004` (`TIMEOUT`) | Process exceeded `--timeout` threshold (default 60s). |
 | `125` | **Disarmed / Quota Exhausted** | `-32001` (`DISARMED`) | Daemon is locked. Operator must run `sudo agent-root-runner arm`. |
 | `126` | **Guardrail Blocked** | `-32002` (`GUARDRAIL_BLOCKED`) | Command matched an OS destabilization rule. |
-| `128` | **Internal Daemon Error** | `-32603` (`INTERNAL_ERROR`) | Unexpected daemon error or RPC protocol failure. |
+| `128` | **Internal Daemon Error** | `-32603` (`INTERNAL_ERROR`) | Unexpected daemon error, audit-integrity failure, or RPC protocol failure. |
+| `141` | **Broken Pipe** | — | Output consumer closed the pipe (for example `status \| head`); not an error. |
 
 A command that executes successfully passes its **own** exit status straight
 through (`0`–`255`). The codes above are emitted by the wrapper for *daemon-level*
