@@ -10,6 +10,11 @@ use uuid::Uuid;
 
 pub const MAX_DURATION_SECONDS: u64 = 86_400;
 const DEFAULT_DURATION_SECONDS: u64 = 900;
+/// F1: absolute byte cap for the command text embedded in audit records.
+/// Whatever the RPC layer does or does not enforce, no caller can
+/// amplify the audit log through the command copy.
+const MAX_AUDIT_COMMAND_BYTES: usize = 512;
+const AUDIT_COMMAND_MARKER: &str = "[truncated]";
 struct Session {
     id: String,
     started: SystemTime,
@@ -28,6 +33,15 @@ struct Inner {
     lifetime: u64,
     last: Option<String>,
     generation: u64,
+    /// F5: an admission lifecycle is in progress (from `admit` until its
+    /// result or refund is durably recorded). Re-arm is refused while
+    /// set, so an in-flight command is always charged to the session that
+    /// authorized it and can never outlive its own accounting.
+    in_flight: bool,
+    /// The most recent successful admission, used to keep EXEC_START
+    /// truthful (F7): an admission invalidated before spawn must not be
+    /// recorded as ADMITTED.
+    last_admit: Option<Admission>,
 }
 pub struct StateMachine {
     inner: Mutex<Inner>,
@@ -35,7 +49,7 @@ pub struct StateMachine {
     audit: Arc<AuditLogger>,
     allow_user_arm: bool,
 }
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub struct Admission {
     pub remaining_seconds: Option<f64>,
     pub(crate) deadline: Option<Instant>,
@@ -85,6 +99,8 @@ impl StateMachine {
                 lifetime: 0,
                 last: None,
                 generation: 0,
+                in_flight: false,
+                last_admit: None,
             }),
             pgid,
             audit,
@@ -147,10 +163,25 @@ impl StateMachine {
                 "Audit logging previously failed; the daemon is fail-closed.",
             ));
         }
+        // F5: while a command is in flight (from admission until its
+        // result or refund is durably recorded) the current session must
+        // stay put, so the command is charged to the session that
+        // authorized it. Refuse the re-arm instead of killing or
+        // re-attributing a running command.
+        if g.in_flight {
+            return Err(RpcError {
+                code: -32000,
+                message: "Cannot re-arm while a command is executing; wait for it to \
+                          complete or disarm first."
+                    .into(),
+                reason: Some("COMMAND_IN_FLIGHT".into()),
+            });
+        }
         g.generation += 1;
         g.armed = true;
         g.commands = 0;
         g.last = None;
+        g.last_admit = None;
         g.session = Some(Session {
             id: id.clone(),
             started: now,
@@ -309,6 +340,12 @@ impl StateMachine {
             "Service is DISARMED. Run 'sudo agent-root-runner arm' to enable."
         }
         .to_string();
+        let mut data = object(&[
+            ("command", json!(audit_command(command))),
+            ("decision", json!("DENIED_DISARMED")),
+            ("reason", json!(msg)),
+        ]);
+        tag_exec_record(&g, "EXEC_REJECTED", &mut data);
         let audit = self.emit_locked(
             &mut g,
             "EXEC_REJECTED",
@@ -316,11 +353,7 @@ impl StateMachine {
             Some(uid),
             Some(gid),
             Some(comm),
-            object(&[
-                ("command", json!(command)),
-                ("decision", json!("DENIED_DISARMED")),
-                ("reason", json!(msg)),
-            ]),
+            data,
         );
         if let Err(error) = audit {
             drop(g);
@@ -344,6 +377,15 @@ impl StateMachine {
         if g.audit_failed {
             return Err("Audit logging previously failed; the daemon is fail-closed.".into());
         }
+        // F6: a blank or NUL-bearing command can never spawn (the executor
+        // rejects it after the fact), so refuse it here — before the quota
+        // slot is consumed and before any ADMITTED/ALLOWED audit record
+        // can exist for a command that never runs.
+        if command.trim().is_empty() || command.contains('\0') {
+            return Err(
+                "Invalid params: 'command' must not be blank or contain null bytes.".into(),
+            );
+        }
         if g.armed && expired(&g) {
             self.transition(&mut g, "TIMEOUT_EXPIRED", "TIMEOUT_LOCK", None)?;
         }
@@ -353,6 +395,12 @@ impl StateMachine {
             } else {
                 "Service is DISARMED. Run 'sudo agent-root-runner arm' to enable."
             };
+            let mut data = object(&[
+                ("command", json!(audit_command(command))),
+                ("decision", json!("DENIED_DISARMED")),
+                ("reason", json!(msg)),
+            ]);
+            tag_exec_record(&g, "EXEC_REJECTED", &mut data);
             let audit = self.emit_locked(
                 &mut g,
                 "EXEC_REJECTED",
@@ -360,11 +408,7 @@ impl StateMachine {
                 Some(uid),
                 Some(gid),
                 Some(comm),
-                object(&[
-                    ("command", json!(command)),
-                    ("decision", json!("DENIED_DISARMED")),
-                    ("reason", json!(msg)),
-                ]),
+                data,
             );
             if let Err(error) = audit {
                 drop(g);
@@ -407,12 +451,17 @@ impl StateMachine {
         if final_slot {
             self.transition(&mut g, "QUOTA_EXHAUSTED", "QUOTA_LOCK", None)?;
         }
-        Ok(Admission {
+        let admission = Admission {
             remaining_seconds: remain,
             deadline,
             generation: g.generation,
             final_slot,
-        })
+        };
+        // F5: from admission until the result/refund is recorded, the
+        // session that authorized this command must remain current.
+        g.in_flight = true;
+        g.last_admit = Some(admission.clone());
+        Ok(admission)
     }
     #[cfg(test)]
     pub fn admission_valid(&self, a: &Admission) -> bool {
@@ -438,6 +487,9 @@ impl StateMachine {
             self.transition(&mut guard, "TIMEOUT_EXPIRED", "TIMEOUT_LOCK", None)?;
             return Err("ARM deadline expired before process start.".into());
         }
+        // F5: the in-flight window covers the spawn itself as well
+        // (admissions granted by `admit` already set it).
+        guard.in_flight = true;
         Ok(SpawnPermit { _guard: guard })
     }
     pub fn refund_quota(&self) -> Result<(), String> {
@@ -448,6 +500,11 @@ impl StateMachine {
         if g.audit_failed {
             return Err("Audit logging previously failed; the daemon is fail-closed.".into());
         }
+        // F5/F10: the admission lifecycle this refund closes has ended;
+        // re-arm becomes possible again and the refund stays attributable
+        // to the session that actually admitted the command.
+        g.in_flight = false;
+        g.last_admit = None;
         if expired(&g) && (g.armed || g.last.as_deref() == Some("QUOTA_EXHAUSTED")) {
             self.transition(&mut g, "TIMEOUT_EXPIRED", "TIMEOUT_LOCK", None)?;
         }
@@ -512,12 +569,32 @@ impl StateMachine {
         peer_uid: Option<u32>,
         peer_gid: Option<u32>,
         peer_comm: Option<&str>,
-        data: serde_json::Map<String, Value>,
+        mut data: serde_json::Map<String, Value>,
     ) -> Result<(), String> {
         let mut g = self
             .inner
             .lock()
             .map_err(|_| "state mutex poisoned".to_string())?;
+        // F7: an admission invalidated before spawn (disarm, expiry,
+        // generation bump, or audit failure landing between admit and
+        // start) must not be durably recorded as ADMITTED — the command
+        // never ran. Record the abort instead, keeping the trail complete
+        // and truthful.
+        let mut event_type = event_type;
+        if event_type == "EXEC_START"
+            && g.last_admit
+                .as_ref()
+                .is_some_and(|a| !admission_still_valid(&g, a))
+        {
+            let command = data.get("command").cloned().unwrap_or(Value::Null);
+            event_type = "EXEC_ABORTED";
+            data = object(&[
+                ("command", command),
+                ("decision", json!("ABORTED")),
+                ("reason", json!("ADMISSION_INVALIDATED_BEFORE_SPAWN")),
+            ]);
+        }
+        tag_exec_record(&g, event_type, &mut data);
         let result = self.emit_locked(
             &mut g, event_type, peer_pid, peer_uid, peer_gid, peer_comm, data,
         );
@@ -534,7 +611,7 @@ impl StateMachine {
         peer_uid: u32,
         peer_gid: u32,
         peer_comm: &str,
-        data: serde_json::Map<String, Value>,
+        mut data: serde_json::Map<String, Value>,
     ) -> Result<(), String> {
         let mut g = self
             .inner
@@ -542,6 +619,11 @@ impl StateMachine {
             .map_err(|_| "state mutex poisoned".to_string())?;
         g.commands += 1;
         g.lifetime += 1;
+        // F5: the command lifecycle is complete — its result is charged to
+        // the session that authorized it, and re-arm is possible again.
+        g.in_flight = false;
+        g.last_admit = None;
+        tag_exec_record(&g, event_type, &mut data);
         let result = self.emit_locked(
             &mut g,
             event_type,
@@ -636,6 +718,50 @@ impl StateMachine {
         }
     }
 }
+/// F1: bound the command text embedded in audit records. The copy is
+/// capped at an absolute byte budget with an explicit truncation marker,
+/// so no caller can amplify the audit log regardless of what the RPC
+/// layer enforces.
+fn audit_command(command: &str) -> String {
+    if command.len() <= MAX_AUDIT_COMMAND_BYTES {
+        return command.to_string();
+    }
+    // Leave room for the marker inside the cap and never split a UTF-8
+    // character.
+    let mut cut = MAX_AUDIT_COMMAND_BYTES - AUDIT_COMMAND_MARKER.len();
+    while cut > 0 && !command.is_char_boundary(cut) {
+        cut -= 1;
+    }
+    format!("{}{AUDIT_COMMAND_MARKER}", &command[..cut])
+}
+/// F1/F7: every EXEC_* audit record names the arm session it belongs to
+/// (explicit null when no session exists), and the peer-supplied command
+/// copy respects the byte cap.
+fn tag_exec_record(g: &Inner, event_type: &str, data: &mut serde_json::Map<String, Value>) {
+    if event_type.starts_with("EXEC_") {
+        data.entry("session_id".to_string()).or_insert_with(|| {
+            g.session
+                .as_ref()
+                .map(|s| json!(s.id))
+                .unwrap_or(Value::Null)
+        });
+    }
+    if let Some(Value::String(command)) = data.get_mut("command") {
+        if command.len() > MAX_AUDIT_COMMAND_BYTES {
+            *command = audit_command(command);
+        }
+    }
+}
+/// Mirrors `spawn_permit`: would this admission still be allowed to
+/// spawn right now? Used to keep EXEC_START truthful (F7).
+fn admission_still_valid(g: &Inner, a: &Admission) -> bool {
+    !g.audit_failed
+        && g.generation == a.generation
+        && (g.armed || a.final_slot && g.last.as_deref() == Some("QUOTA_EXHAUSTED"))
+        && !a
+            .deadline
+            .is_some_and(|deadline| Instant::now() >= deadline)
+}
 fn expired(g: &Inner) -> bool {
     g.session
         .as_ref()
@@ -657,6 +783,11 @@ fn active_elapsed(g: &Inner) -> f64 {
 fn status_inner(g: &Inner) -> Value {
     let s = g.session.as_ref();
     let timed = if g.armed { s } else { None };
+    // F9 (documented intent): the quota fields deliberately keep
+    // describing the most recent arm session even while disarmed — a
+    // QUOTA_LOCK disarm must still report quota_remaining: 0, matching
+    // commands_executed and the callers that rely on it. Only the time
+    // fields above are nulled when disarmed.
     let duration = timed.and_then(|s| s.duration);
     let forever = g.armed && s.is_some_and(|s| s.duration.is_none());
     let rem = if !g.armed {
@@ -1047,6 +1178,262 @@ mod tests {
         assert!(
             active <= 1.0,
             "active duration {active}s exceeded the 1s session"
+        );
+        let _ = fs::remove_file(p);
+    }
+
+    // ---- F1: the audited command copy can never amplify the log ----
+
+    #[test]
+    fn disarmed_rejection_caps_the_audited_command_copy() {
+        let (m, p) = machine();
+        let huge = "x".repeat(2 * 1024 * 1024);
+        m.reject_if_disarmed(1, 0, 0, "probe", &huge).unwrap();
+
+        let log = fs::read_to_string(&p).unwrap();
+        assert!(
+            log.len() < 4096,
+            "one disarmed rejection appended {} bytes to the audit log",
+            log.len()
+        );
+        let record: Value =
+            serde_json::from_str(log.lines().next().unwrap()).expect("audit record parses");
+        assert_eq!(record["event_type"], "EXEC_REJECTED");
+        assert_eq!(record["decision"], "DENIED_DISARMED");
+        let command = record["command"].as_str().unwrap();
+        assert!(
+            command.len() <= MAX_AUDIT_COMMAND_BYTES,
+            "command copy is {} bytes",
+            command.len()
+        );
+        assert!(command.ends_with(AUDIT_COMMAND_MARKER));
+        assert!(command.starts_with(&"x".repeat(256)));
+        // Session correlation is explicit even before any arm exists.
+        assert!(
+            record.get("session_id").is_some() && record["session_id"].is_null(),
+            "pre-arm rejection must carry an explicit null session_id: {record}"
+        );
+        let _ = fs::remove_file(p);
+    }
+
+    #[test]
+    fn audit_command_copy_caps_at_exactly_512_bytes() {
+        let fits = "a".repeat(MAX_AUDIT_COMMAND_BYTES);
+        assert_eq!(audit_command(&fits), fits);
+        assert_eq!(audit_command("").len(), 0);
+        let over = audit_command(&"a".repeat(MAX_AUDIT_COMMAND_BYTES + 1));
+        assert!(over.len() <= MAX_AUDIT_COMMAND_BYTES);
+        assert!(over.ends_with(AUDIT_COMMAND_MARKER));
+        assert!(over.starts_with(&"a".repeat(488)));
+        // Multi-byte UTF-8 is never split mid-character.
+        let euro = "€".repeat(200); // 600 bytes
+        let capped = audit_command(&euro);
+        assert!(capped.len() <= MAX_AUDIT_COMMAND_BYTES);
+        assert!(capped.ends_with(AUDIT_COMMAND_MARKER));
+        assert!(capped.starts_with(&"€".repeat(166)));
+    }
+
+    // ---- F5/F10: a command lifecycle pins its arm session ----
+
+    #[test]
+    fn rearm_is_refused_while_an_admission_is_in_flight() {
+        let (m, p) = machine();
+        m.arm(Some(30), Some(2), false, 0, 1).unwrap();
+        // An admitted-but-not-yet-spawned admission already blocks re-arm:
+        // the executor-error refund path must stay attributable to the
+        // session that admitted the command (F10).
+        let admission = m.admit(1, 0, 0, "test", "echo x").unwrap();
+        let refused = m.arm(Some(30), None, false, 0, 1).unwrap_err();
+        assert_eq!(refused.code, -32000);
+        assert_eq!(refused.reason.as_deref(), Some("COMMAND_IN_FLIGHT"));
+
+        // Executor-error path: the refund ends the admission lifecycle
+        // and re-arm becomes possible again.
+        drop(m.spawn_permit(&admission).unwrap());
+        m.refund_quota().unwrap();
+        m.arm(Some(30), None, false, 0, 1).unwrap();
+
+        // Successful-command path: record_execution ends it too. The
+        // spawn permit is dropped right after spawn, exactly like the
+        // executor does.
+        let admission = m.admit(1, 0, 0, "test", "echo y").unwrap();
+        drop(m.spawn_permit(&admission).unwrap());
+        m.record_execution("EXEC_ALLOWED", 1, 0, 0, "test", object(&[]))
+            .unwrap();
+        m.arm(Some(30), None, false, 0, 1).unwrap();
+        let _ = fs::remove_file(p);
+    }
+
+    // ---- F6: invalid commands must not burn quota or reach the log ----
+
+    #[test]
+    fn empty_or_nul_command_rejection_does_not_consume_quota() {
+        let (m, p) = machine();
+        m.arm(Some(30), Some(1), false, 0, 1).unwrap();
+        for bad in ["", "   ", "echo \u{0} x"] {
+            let error = m.admit(1, 0, 0, "test", bad).unwrap_err();
+            assert!(
+                error.contains("Invalid params"),
+                "invalid command {bad:?} misclassified: {error}"
+            );
+        }
+        let status = m.status().unwrap();
+        assert_eq!(status["is_armed"], true);
+        assert_eq!(
+            status["quota_remaining"], 1,
+            "invalid commands must not burn the quota slot"
+        );
+        let log = fs::read_to_string(&p).unwrap();
+        assert!(
+            !log.contains("EXEC_"),
+            "invalid commands must not reach the audit log: {log}"
+        );
+        // The final slot is still spendable on a real command.
+        let admission = m.admit(1, 0, 0, "test", "echo ok").unwrap();
+        assert!(admission.final_slot);
+        let _ = fs::remove_file(p);
+    }
+
+    // ---- F7: EXEC_START truthfulness and session correlation ----
+
+    #[test]
+    fn invalidated_admission_is_never_audited_as_started() {
+        let (m, p) = machine();
+        m.arm(Some(30), Some(2), false, 0, 1).unwrap();
+        let admission = m.admit(1, 0, 0, "test", "echo x").unwrap();
+        // A disarm lands between admission and process start.
+        m.disarm(0).unwrap();
+
+        m.audit_event(
+            "EXEC_START",
+            Some(1),
+            Some(0),
+            Some(0),
+            Some("test"),
+            object(&[
+                ("command", json!("echo x")),
+                ("decision", json!("ADMITTED")),
+            ]),
+        )
+        .unwrap();
+        assert!(m.spawn_permit(&admission).is_err());
+
+        let log = fs::read_to_string(&p).unwrap();
+        assert!(!log.contains("EXEC_START"), "audit log: {log}");
+        assert!(!log.contains("ADMITTED"), "audit log: {log}");
+        let aborted = log
+            .lines()
+            .filter_map(|l| serde_json::from_str::<Value>(l).ok())
+            .find(|v| v["event_type"] == "EXEC_ABORTED")
+            .expect("EXEC_ABORTED compensating record");
+        assert_eq!(aborted["decision"], "ABORTED");
+        assert_eq!(aborted["reason"], "ADMISSION_INVALIDATED_BEFORE_SPAWN");
+        assert_eq!(aborted["command"], "echo x");
+        assert!(aborted["session_id"].is_string());
+        let _ = fs::remove_file(p);
+    }
+
+    #[test]
+    fn final_slot_admission_is_still_audited_as_started() {
+        let (m, p) = machine();
+        m.arm(Some(30), Some(1), false, 0, 1).unwrap();
+        let admission = m.admit(1, 0, 0, "test", "echo final").unwrap();
+        assert!(admission.final_slot);
+        // QUOTA_LOCK disarmed the machine, but the final-slot admission
+        // remains spawnable: EXEC_START must still be recorded.
+        m.audit_event(
+            "EXEC_START",
+            Some(1),
+            Some(0),
+            Some(0),
+            Some("test"),
+            object(&[
+                ("command", json!("echo final")),
+                ("decision", json!("ADMITTED")),
+            ]),
+        )
+        .unwrap();
+        assert!(m.spawn_permit(&admission).is_ok());
+        let log = fs::read_to_string(&p).unwrap();
+        assert!(log.contains("EXEC_START"), "audit log: {log}");
+        assert!(log.contains("ADMITTED"), "audit log: {log}");
+        assert!(!log.contains("EXEC_ABORTED"), "audit log: {log}");
+        let _ = fs::remove_file(p);
+    }
+
+    #[test]
+    fn exec_audit_records_carry_the_authorizing_session_id() {
+        let (m, p) = machine();
+        // A rejection before any arm carries an explicit null session_id.
+        m.reject_if_disarmed(1, 0, 0, "test", "echo denied")
+            .unwrap();
+        let armed = m.arm(Some(30), None, false, 0, 1).unwrap();
+        let sid = armed["session_id"].as_str().unwrap().to_string();
+        m.audit_event(
+            "EXEC_BLOCKED",
+            Some(1),
+            Some(0),
+            Some(0),
+            Some("test"),
+            object(&[
+                ("command", json!("echo blocked")),
+                ("decision", json!("GUARDRAIL_BLOCKED")),
+            ]),
+        )
+        .unwrap();
+        let _admission = m.admit(1, 0, 0, "test", "echo x").unwrap();
+        m.audit_event(
+            "EXEC_START",
+            Some(1),
+            Some(0),
+            Some(0),
+            Some("test"),
+            object(&[
+                ("command", json!("echo x")),
+                ("decision", json!("ADMITTED")),
+            ]),
+        )
+        .unwrap();
+        m.record_execution(
+            "EXEC_ALLOWED",
+            1,
+            0,
+            0,
+            "test",
+            object(&[("command", json!("echo x")), ("decision", json!("ALLOWED"))]),
+        )
+        .unwrap();
+        m.disarm(0).unwrap();
+        m.reject_if_disarmed(1, 0, 0, "test", "echo after").unwrap();
+
+        let mut saw_pre_arm_rejection = false;
+        let mut correlated = 0;
+        for line in fs::read_to_string(&p).unwrap().lines() {
+            let record: Value = serde_json::from_str(line)
+                .unwrap_or_else(|e| panic!("unparseable audit line: {e}: {line}"));
+            let event = record["event_type"].as_str().unwrap_or_default();
+            match event {
+                "EXEC_REJECTED" if record["session_id"].is_null() => {
+                    saw_pre_arm_rejection = true;
+                }
+                "EXEC_BLOCKED" | "EXEC_START" | "EXEC_ALLOWED" | "EXEC_REJECTED" => {
+                    assert_eq!(
+                        record["session_id"].as_str(),
+                        Some(sid.as_str()),
+                        "{event} lacks session correlation: {record}"
+                    );
+                    correlated += 1;
+                }
+                _ => {}
+            }
+        }
+        assert!(
+            saw_pre_arm_rejection,
+            "pre-arm rejection lacks its explicit null session_id"
+        );
+        assert!(
+            correlated >= 4,
+            "expected EXEC_BLOCKED/EXEC_START/EXEC_ALLOWED/post-disarm EXEC_REJECTED, got {correlated}"
         );
         let _ = fs::remove_file(p);
     }

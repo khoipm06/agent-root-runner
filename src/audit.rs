@@ -3,11 +3,11 @@ use serde_json::{Map, Value, json};
 use std::fs::{self, File, OpenOptions};
 use std::io::Write;
 use std::os::fd::AsRawFd;
-use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 #[cfg(test)]
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use uuid::Uuid;
 
 pub const PROD_AUDIT_PATH: &str = "/var/log/agent-root-runner/audit.log";
@@ -18,6 +18,16 @@ pub struct AuditLogger {
     fail_next_event: AtomicBool,
     #[cfg(test)]
     fail_next_sync: AtomicBool,
+    #[cfg(test)]
+    fail_after_bytes: AtomicUsize,
+}
+
+// Test-only Debug: regression tests unwrap_err() on AuditLogger::open.
+#[cfg(test)]
+impl std::fmt::Debug for AuditLogger {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AuditLogger").finish_non_exhaustive()
+    }
 }
 
 impl AuditLogger {
@@ -49,18 +59,46 @@ impl AuditLogger {
                 }
             }
         }
+        // F3: reject non-regular files *before* opening. Opening a FIFO
+        // with no reader blocks forever in open(2), so the post-open
+        // regular-file check below would never get a chance to run and the
+        // daemon would hang at startup with no diagnostic. A missing path
+        // falls through: open(2) below creates it.
+        if let Ok(metadata) = fs::symlink_metadata(&path) {
+            if !metadata.is_file() {
+                return Err(format!(
+                    "Audit path is not a regular file: {}",
+                    path.display()
+                ));
+            }
+        }
         let file = OpenOptions::new()
             .create(true)
             .append(true)
             .write(true)
             .mode(0o600)
-            .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+            // O_NONBLOCK is a no-op for regular files but keeps a FIFO
+            // raced in between the stat above and this open from blocking.
+            .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK)
             .open(&path)
             .map_err(|e| format!("Cannot open audit log {}: {e}", path.display()))?;
-        if !file.metadata().map_err(|e| e.to_string())?.is_file() {
+        let metadata = file.metadata().map_err(|e| e.to_string())?;
+        if !metadata.is_file() {
             return Err(format!(
                 "Audit path is not a regular file: {}",
                 path.display()
+            ));
+        }
+        // F4: forcing mode 0600 is not enough — an attacker-owned file
+        // keeps read/truncate/delete rights over the daemon's audit trail
+        // even after the fchmod. The trail must belong to the effective
+        // user (root for the production daemon) or to root itself.
+        let euid = unsafe { libc::geteuid() };
+        if !audit_owner_acceptable(metadata.uid(), euid) {
+            return Err(format!(
+                "Audit log {} is owned by uid {} but the daemon runs as uid {euid}; refusing an untrusted audit trail",
+                path.display(),
+                metadata.uid()
             ));
         }
         if unsafe { libc::fchmod(file.as_raw_fd(), 0o600) } != 0 {
@@ -76,6 +114,8 @@ impl AuditLogger {
             fail_next_event: AtomicBool::new(false),
             #[cfg(test)]
             fail_next_sync: AtomicBool::new(false),
+            #[cfg(test)]
+            fail_after_bytes: AtomicUsize::new(0),
         })
     }
 
@@ -89,6 +129,15 @@ impl AuditLogger {
         self.fail_next_sync.store(true, Ordering::SeqCst);
     }
 
+    /// F2 test hook: the next event writes only `bytes` bytes of its
+    /// record before failing, reproducing a mid-record ENOSPC/EFBIG
+    /// without touching the process-wide RLIMIT_FSIZE (which would make
+    /// unrelated parallel tests flaky).
+    #[cfg(test)]
+    pub(crate) fn fail_after_bytes_for_test(&self, bytes: usize) {
+        self.fail_after_bytes.store(bytes, Ordering::SeqCst);
+    }
+
     #[cfg(test)]
     pub(crate) fn full_for_test() -> Self {
         let file = OpenOptions::new().write(true).open("/dev/full").unwrap();
@@ -96,6 +145,7 @@ impl AuditLogger {
             file: Mutex::new(file),
             fail_next_event: AtomicBool::new(false),
             fail_next_sync: AtomicBool::new(false),
+            fail_after_bytes: AtomicUsize::new(0),
         }
     }
 
@@ -151,14 +201,53 @@ impl AuditLogger {
             .file
             .lock()
             .map_err(|_| "audit mutex poisoned".to_string())?;
-        file.write_all(&line)
-            .map_err(|e| format!("audit write failed: {e}"))?;
+        // F2: capture the pre-write length. If the write (or its sync)
+        // fails partway, truncate back to this offset so the file never
+        // ends mid-record — a restarted daemon appending after
+        // unterminated bytes would glue two records onto one unparseable
+        // line.
+        let start_len = file
+            .metadata()
+            .map_err(|e| format!("audit stat failed: {e}"))?
+            .len();
+        #[cfg(test)]
+        let inject_partial_bytes = self.fail_after_bytes.swap(0, Ordering::SeqCst);
+        #[cfg(test)]
+        let write_result = if inject_partial_bytes > 0 {
+            let cut = inject_partial_bytes.min(line.len().saturating_sub(1));
+            file.write_all(&line[..cut]).and_then(|_| {
+                Err(std::io::Error::new(
+                    std::io::ErrorKind::WriteZero,
+                    "injected partial audit write failure",
+                ))
+            })
+        } else {
+            file.write_all(&line)
+        };
+        #[cfg(not(test))]
+        let write_result = file.write_all(&line);
+        if let Err(error) = write_result {
+            // Best effort: on a full disk this may fail too, but the
+            // common partial-write case leaves a clean tail.
+            let _ = file.set_len(start_len);
+            return Err(format!("audit write failed: {error}"));
+        }
         #[cfg(test)]
         if self.fail_next_sync.swap(false, Ordering::SeqCst) {
+            // The record was fully written; keep it. The injected
+            // sync-stage failure models "write succeeded, fdatasync
+            // failed" with the record intact, which the existing
+            // fail-closed regression coverage asserts on.
             return Err("audit fdatasync failed: injected sync error".into());
         }
-        file.sync_data()
-            .map_err(|e| format!("audit fdatasync failed: {e}"))
+        if let Err(error) = file.sync_data() {
+            // Durability was never confirmed, so the record is not
+            // acknowledged: roll it back too — a failed writeback could
+            // otherwise leave a partial durable line.
+            let _ = file.set_len(start_len);
+            return Err(format!("audit fdatasync failed: {error}"));
+        }
+        Ok(())
     }
 }
 
@@ -170,9 +259,132 @@ fn private_dir_owned(path: &Path) -> bool {
     md.is_dir() && md.uid() == unsafe { libc::geteuid() } && md.permissions().mode() & 0o077 == 0
 }
 
+/// F4: the audit file must belong to the effective user (root for the
+/// production daemon) or to root itself. Any other owner keeps
+/// read/truncate/delete rights over the daemon's trail even after the
+/// 0600 fchmod.
+fn audit_owner_acceptable(owner_uid: u32, euid: u32) -> bool {
+    owner_uid == euid || owner_uid == 0
+}
+
 pub fn object(pairs: &[(&str, Value)]) -> Map<String, Value> {
     pairs
         .iter()
         .map(|(k, v)| ((*k).to_string(), v.clone()))
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::ffi::CString;
+
+    fn scratch_dir(tag: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "arr-audit-{tag}-{}-{}",
+            std::process::id(),
+            Uuid::new_v4()
+        ));
+        fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn partial_write_failure_rolls_back_to_a_complete_record_tail() {
+        let dir = scratch_dir("rollback");
+        let path = dir.join("audit.log");
+        let logger = AuditLogger::open(Some(path.to_str().unwrap()), true).unwrap();
+        logger
+            .event("DAEMON_START", None, None, None, None, object(&[]))
+            .unwrap();
+        let durable_len = fs::metadata(&path).unwrap().len();
+        assert!(durable_len > 0);
+
+        // F2: a write that fails mid-record must not leave unterminated
+        // bytes in the file.
+        logger.fail_after_bytes_for_test(64);
+        let error = logger
+            .event(
+                "EXEC_REJECTED",
+                Some(1),
+                Some(0),
+                Some(0),
+                Some("probe"),
+                object(&[("command", json!("x".repeat(300)))]),
+            )
+            .unwrap_err();
+        assert!(error.contains("audit write failed"), "{error}");
+        assert_eq!(
+            fs::metadata(&path).unwrap().len(),
+            durable_len,
+            "partial bytes from the failed record must be truncated back"
+        );
+
+        // The next durable record appends cleanly: every line parses.
+        logger
+            .event("DAEMON_STOP", None, None, None, None, object(&[]))
+            .unwrap();
+        let text = fs::read_to_string(&path).unwrap();
+        let events: Vec<String> = text
+            .lines()
+            .filter_map(|l| serde_json::from_str::<Value>(l).ok())
+            .map(|v| v["event_type"].as_str().unwrap().to_string())
+            .collect();
+        assert_eq!(
+            events,
+            ["DAEMON_START", "DAEMON_STOP"],
+            "the log tail must be complete, parseable records: {text}"
+        );
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn fifo_and_directory_audit_paths_are_rejected_without_opening() {
+        let dir = scratch_dir("fifo");
+        let fifo = dir.join("audit.log");
+        let cpath = CString::new(fifo.to_str().unwrap()).unwrap();
+        assert_eq!(unsafe { libc::mkfifo(cpath.as_ptr(), 0o600) }, 0);
+
+        // A FIFO with no reader must be refused instantly instead of
+        // hanging the daemon at startup (F3).
+        let error = AuditLogger::open(Some(fifo.to_str().unwrap()), true).unwrap_err();
+        assert!(error.contains("not a regular file"), "{error}");
+
+        let nested = dir.join("nested");
+        fs::create_dir(&nested).unwrap();
+        let error = AuditLogger::open(Some(nested.to_str().unwrap()), true).unwrap_err();
+        assert!(error.contains("not a regular file"), "{error}");
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn audit_file_ownership_policy_accepts_only_the_effective_user_or_root() {
+        // Root daemon: an attacker-owned trail is refused.
+        assert!(audit_owner_acceptable(0, 0));
+        assert!(!audit_owner_acceptable(1000, 0));
+        // User daemon: own files are fine, foreign users are not.
+        assert!(audit_owner_acceptable(1000, 1000));
+        assert!(!audit_owner_acceptable(1001, 1000));
+        // A root-owned file for a user daemon is ownership-acceptable;
+        // the 0600 fchmod still gates actual access.
+        assert!(audit_owner_acceptable(0, 1000));
+    }
+
+    #[test]
+    fn foreign_owned_audit_file_is_rejected_under_root() {
+        if unsafe { libc::geteuid() } != 0 {
+            // chown to another user requires root; the ownership
+            // predicate itself is covered by the unit test above.
+            return;
+        }
+        let dir = scratch_dir("owner");
+        let path = dir.join("audit.log");
+        fs::write(&path, "seed").unwrap();
+        let cpath = CString::new(path.to_str().unwrap()).unwrap();
+        assert_eq!(unsafe { libc::chown(cpath.as_ptr(), 1, 1) }, 0);
+
+        let error = AuditLogger::open(Some(path.to_str().unwrap()), true).unwrap_err();
+        assert!(error.contains("owned by uid"), "{error}");
+        fs::remove_dir_all(&dir).unwrap();
+    }
 }
