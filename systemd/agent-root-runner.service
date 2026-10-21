@@ -5,8 +5,12 @@ After=network.target
 [Service]
 Type=simple
 ExecStart=/usr/local/bin/agent-root-runner daemon --socket /run/agent-root-runner/runner.sock --audit-log /var/log/agent-root-runner/audit.log
+# No Group= here on purpose: the checked-in unit must work on distros that
+# have no `wheel` group (Debian/Ubuntu use `sudo`). `agent-root-runner
+# install` appends a `Group=<wheel|sudo|adm>` line at install time when a
+# standard administrative group exists; otherwise the socket stays
+# root-only, which is strictly safer.
 User=root
-Group=wheel
 RuntimeDirectory=agent-root-runner
 RuntimeDirectoryMode=0750
 StandardOutput=journal
