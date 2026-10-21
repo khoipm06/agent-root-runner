@@ -13,6 +13,12 @@ ExecStart=/usr/local/bin/agent-root-runner daemon --socket /run/agent-root-runne
 User=root
 RuntimeDirectory=agent-root-runner
 RuntimeDirectoryMode=0750
+# Bound the privileged daemon and its descendants even where RLIMIT_NPROC is
+# a no-op for root: a fork bomb cannot exceed this many tasks in the cgroup.
+TasksMax=2048
+# The daemon holds a bounded client pool (256) plus process pipes; keep
+# headroom above systemd's 1024 default.
+LimitNOFILE=8192
 StandardOutput=journal
 StandardError=journal
 Restart=on-failure
