@@ -6,8 +6,15 @@ on:
     types: [opened, reopened, synchronize, ready_for_review]
 if: github.event.pull_request.draft == false
 engine:
-  id: copilot
-  model: gpt-4.1
+  id: codex
+  model: nvidia/nemotron-3.5-super-vl-120b-a12b
+  env:
+    OPENAI_BASE_URL: https://integrate.api.nvidia.com/v1
+    OPENAI_API_KEY: ${{ secrets.NVIDIA_API_KEY }}
+network:
+  allowed:
+    - defaults
+    - integrate.api.nvidia.com
 imports:
   - .github/agents/security-reviewer.agent.md
 permissions:
