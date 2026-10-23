@@ -11,6 +11,10 @@ engine:
   env:
     OPENAI_BASE_URL: https://integrate.api.nvidia.com/v1
     OPENAI_API_KEY: ${{ secrets.NVIDIA_API_KEY }}
+models:
+  default-ai-credits-pricing:
+    input: 0.000001
+    output: 0.000001
 network:
   allowed:
     - defaults
