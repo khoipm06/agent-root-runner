@@ -109,7 +109,7 @@ struct ExecArgs {
 }
 
 fn main() -> ExitCode {
-    // Rust starts with SIGPIPE ignored, which turns a broken downstream pipe
+    // The runtime starts with SIGPIPE ignored, which turns a broken downstream pipe
     // (`status | head`) into a print panic (exit 101). Restore the default
     // disposition so the process ends quietly on EPIPE instead (shells
     // report 128+13=141, matching POSIX tools).

@@ -12,10 +12,10 @@ Agent Root Runner is a Linux privilege boundary: a local agent can request root 
 
 ## Implementation expectations
 
-- The shipped program is one native Rust executable. Do not add a second runtime, launcher, or implementation language.
+- The shipped program is one native compiled executable. Do not add a second runtime, launcher, or implementation language.
 - Preserve the one-binary `agent-root-runner` interface and keep systemd, installer, MCP, CLI, and Plasma integration consistent.
 - Keep changes focused; document security-relevant behavior and add regression tests for security invariants.
-- Run `cargo fmt --all -- --check` and `cargo test --locked --all-targets` for Rust changes, plus relevant black-box/E2E checks. Do not claim tests passed unless they were run.
+- Run `cargo fmt --all -- --check` and `cargo test --locked --all-targets` for code changes, plus relevant black-box/E2E checks. Do not claim tests passed unless they were run.
 - Never weaken, remove, or skip guardrails or security tests merely to make a build pass. Call out any unverified behavior explicitly.
 
 AI review is advisory only. Human maintainers remain responsible for security decisions and merges. The generated activation job's `issues: write` permission is solely for the framework's blocked-version notice; the model job is read-only, and model-authored review submissions remain COMMENT-only safe outputs.

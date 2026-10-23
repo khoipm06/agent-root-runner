@@ -27,7 +27,7 @@ daemon:    checks ARMED + quota + timeout, applies guardrails, runs as root
 ## Requirements
 
 - Linux with systemd (for `install`)
-- Rust 1.85+ (to build)
+- Cargo / C toolchain 1.85+ (to build)
 
 ## Install
 

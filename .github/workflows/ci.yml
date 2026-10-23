@@ -22,7 +22,7 @@ jobs:
         uses: actions/checkout@v4
         with:
           persist-credentials: false
-      - name: Set up Rust
+      - name: Set up toolchain
         uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt
@@ -42,7 +42,7 @@ jobs:
         uses: actions/checkout@v4
         with:
           persist-credentials: false
-      - name: Set up Rust
+      - name: Set up toolchain
         uses: dtolnay/rust-toolchain@stable
       - name: Build release executable
         run: cargo build --locked --release

@@ -9,8 +9,8 @@
 ## Validation
 
 - [ ] Tests added or updated for behavior changes.
-- [ ] `cargo fmt --all -- --check` passes (for Rust changes).
-- [ ] `cargo test --locked --all-targets` passes (for Rust changes).
+- [ ] `cargo fmt --all -- --check` passes (for code changes).
+- [ ] `cargo test --locked --all-targets` passes (for code changes).
 - [ ] Relevant E2E, packaging, and manual checks are listed below.
 
 Commands/results:
