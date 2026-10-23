@@ -1,0 +1,18 @@
+{
+  "KPlugin": {
+    "Authors": [
+      {
+        "Name": "Agent Root Runner contributors"
+      }
+    ],
+    "Category": "System Information",
+    "Description": "View and control Agent Root Runner authorization sessions",
+    "Icon": "security-high",
+    "Id": "org.khoipm.agent-root-runner",
+    "License": "MIT",
+    "Name": "Agent Root Runner",
+    "Version": "1.0.0",
+    "Website": "https://github.com/khoipm06/agent-root-runner"
+  },
+  "X-Plasma-API-Minimum-Version": "6.0"
+}
