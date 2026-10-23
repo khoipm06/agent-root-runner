@@ -1387,7 +1387,7 @@ fn mcp_handle_line(line: &str, socket: &Path) -> Option<Value> {
             };
             Some(rpc_result(
                 id,
-                json!({"protocolVersion":protocol,"capabilities":{"tools":{}},"serverInfo":{"name":"agent-root-mcp","version":VERSION}}),
+                json!({"protocolVersion":protocol,"capabilities":{"tools":{}},"serverInfo":{"name":"agent-root-runner","version":VERSION}}),
             ))
         }
         "tools/list" => Some(rpc_result(id, tools_schema())),
@@ -1573,8 +1573,6 @@ fn install() -> Result<i32, String> {
     } else {
         println!("Reinstalled in place: {BIN_PATH}");
     }
-    remove_legacy_install_artifacts(Path::new("/usr/local"))
-        .map_err(|e| format!("Could not remove legacy installation files: {e}"))?;
     let _ = systemctl(&["daemon-reload"]);
     let _ = systemctl(&["enable", "agent-root-runner.service"]);
     if systemctl(&["restart", "agent-root-runner.service"]) != 0 {
@@ -1675,23 +1673,6 @@ fn write_secure(path: &Path, bytes: &[u8], mode: u32) -> Result<(), String> {
     f.sync_all().map_err(|e| e.to_string())?;
     fs::set_permissions(path, fs::Permissions::from_mode(mode)).map_err(|e| e.to_string())
 }
-fn remove_legacy_install_artifacts(usr_local: &Path) -> io::Result<()> {
-    for relative in [
-        "bin/agent-root-runner-daemon",
-        "bin/agent-root-exec",
-        "bin/agent-root-mcp",
-        "lib/agent-root-runner",
-    ] {
-        let path = usr_local.join(relative);
-        match fs::symlink_metadata(&path) {
-            Ok(metadata) if metadata.file_type().is_dir() => fs::remove_dir_all(path)?,
-            Ok(_) => fs::remove_file(path)?,
-            Err(error) if error.kind() == io::ErrorKind::NotFound => (),
-            Err(error) => return Err(error),
-        }
-    }
-    Ok(())
-}
 fn systemctl(args: &[&str]) -> i32 {
     // Do not resolve a root management utility through a caller-controlled PATH.
     let mut c = Command::new("/usr/bin/systemctl");
@@ -1708,53 +1689,6 @@ fn systemctl(args: &[&str]) -> i32 {
 #[cfg(test)]
 mod socket_parent_tests {
     use super::*;
-
-    #[test]
-    fn native_install_cleanup_removes_only_legacy_paths() {
-        let root = std::env::temp_dir().join(format!(
-            "arr-legacy-install-{}-{}",
-            std::process::id(),
-            uuid::Uuid::new_v4()
-        ));
-        let bin = root.join("bin");
-        let legacy_lib = root.join("lib/agent-root-runner/nested");
-        fs::create_dir_all(&bin).unwrap();
-        fs::create_dir_all(&legacy_lib).unwrap();
-        for name in [
-            "agent-root-runner-daemon",
-            "agent-root-exec",
-            "agent-root-mcp",
-            "agent-root-runner",
-            "unrelated-tool",
-        ] {
-            fs::write(bin.join(name), "sentinel").unwrap();
-        }
-        fs::write(legacy_lib.join("server.py"), "sentinel").unwrap();
-
-        remove_legacy_install_artifacts(&root).unwrap();
-
-        for name in [
-            "agent-root-runner-daemon",
-            "agent-root-exec",
-            "agent-root-mcp",
-        ] {
-            assert!(!bin.join(name).exists(), "legacy launcher remains: {name}");
-        }
-        assert!(bin.join("agent-root-runner").exists());
-        assert!(bin.join("unrelated-tool").exists());
-        assert!(!root.join("lib/agent-root-runner").exists());
-
-        let external = root.with_extension("external");
-        fs::create_dir_all(&external).unwrap();
-        fs::write(external.join("keep"), "outside legacy tree").unwrap();
-        std::os::unix::fs::symlink(&external, root.join("lib/agent-root-runner")).unwrap();
-        remove_legacy_install_artifacts(&root).unwrap();
-        assert!(external.join("keep").exists());
-        assert!(!root.join("lib/agent-root-runner").exists());
-
-        fs::remove_dir_all(external).unwrap();
-        fs::remove_dir_all(root).unwrap();
-    }
 
     #[test]
     fn root_socket_parent_policy_rejects_shared_or_redirected_paths_without_mutation() {
