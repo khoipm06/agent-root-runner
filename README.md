@@ -6,6 +6,32 @@ Unix socket without ever handling a `sudo` password. Guardrails block commands
 that would destabilize the OS, and every decision is written to an append-only
 audit log.
 
+## Motivation
+
+AI coding agents (such as Claude Code, Antigravity, and OpenCode) increasingly
+require administrative privileges to install system packages, manage services,
+configure containers, and prepare build environments.
+
+Granting root access to autonomous models introduces a trade-off:
+- **Unrestricted sudo access**: Giving agents `sudo` passwords or blanket
+  `NOPASSWD: ALL` rules risks catastrophic failure—such as wiping block devices,
+  breaking core authentication configurations (`/etc/shadow`, PAM, sudoers),
+  corrupting bootloaders, or creating unwanted persistence mechanisms.
+- **Per-command human confirmation**: Prompting an operator for every individual
+  privileged invocation disrupts agent workflows and defeats autonomy.
+
+**Agent Root Runner** resolves this trade-off:
+- **Human-in-the-loop arming**: An operator explicitly grants a bounded window
+  with an expiration timeout and command quota (`sudo agent-root-runner arm`).
+- **Autonomy without secret sharing**: The agent executes root commands over a
+  local Unix domain socket without ever reading or passing a `sudo` password.
+- **Kernel-verified identity**: Callers are authenticated via kernel peer
+  credentials (`SO_PEERCRED`), preventing impersonation across user boundaries.
+- **OS safety guardrails**: Shell AST inspection blocks commands that threaten
+  the integrity of storage, boot files, authentication, or the root filesystem.
+- **Fail-closed audit log**: All decisions are written to an append-only log with
+  guaranteed disk sync before execution.
+
 ## How it works
 
 ```
