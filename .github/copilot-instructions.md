@@ -13,7 +13,7 @@ Agent Root Runner is a Linux privilege boundary: a local agent can request root 
 ## Implementation expectations
 
 - The shipped program is one native compiled executable. Do not add a second runtime, launcher, or implementation language.
-- Preserve the one-binary `agent-root-runner` interface and keep systemd, installer, MCP, CLI, and Plasma integration consistent.
+- Preserve the one-binary `agent-root-runner` interface and keep systemd, installer, MCP, CLI, and tray indicator integration consistent.
 - Keep changes focused; document security-relevant behavior and add regression tests for security invariants.
 - Run `cargo fmt --all -- --check` and `cargo test --locked --all-targets` for code changes, plus relevant black-box/E2E checks. Do not claim tests passed unless they were run.
 - Never weaken, remove, or skip guardrails or security tests merely to make a build pass. Call out any unverified behavior explicitly.
