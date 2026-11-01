@@ -72,14 +72,32 @@ pub fn is_tray_running_for_uid(uid: u32) -> bool {
     }
 }
 
+fn get_username_by_uid(uid: u32) -> Option<String> {
+    unsafe {
+        let passwd = libc::getpwuid(uid);
+        if !passwd.is_null() && !(*passwd).pw_name.is_null() {
+            Some(
+                std::ffi::CStr::from_ptr((*passwd).pw_name)
+                    .to_string_lossy()
+                    .into_owned(),
+            )
+        } else {
+            None
+        }
+    }
+}
+
 pub fn ensure_tray_running() {
     let (target_uid, target_user) = if let Ok(sudo_uid) = std::env::var("SUDO_UID") {
         let uid: u32 = sudo_uid.parse().unwrap_or(0);
-        let user = std::env::var("SUDO_USER").ok();
+        let user = std::env::var("SUDO_USER")
+            .ok()
+            .or_else(|| get_username_by_uid(uid));
         (uid, user)
     } else if let Ok(pk_uid) = std::env::var("PKEXEC_UID") {
         let uid: u32 = pk_uid.parse().unwrap_or(0);
-        (uid, None)
+        let user = get_username_by_uid(uid);
+        (uid, user)
     } else {
         (unsafe { libc::getuid() }, None)
     };
@@ -89,20 +107,22 @@ pub fn ensure_tray_running() {
     }
 
     if let Some(user) = target_user {
-        let _ = Command::new("su")
+        if let Err(e) = Command::new("su")
             .args([
                 "-",
                 &user,
                 "-c",
-                "nohup /usr/local/bin/agent-root-runner tray >/dev/null 2>&1 &",
+                "nohup /usr/local/bin/agent-root-runner tray &",
             ])
-            .spawn();
+            .spawn()
+        {
+            eprintln!("Warning: failed to spawn tray indicator: {e}");
+        }
     } else {
-        let _ = Command::new(
-            std::env::current_exe().unwrap_or_else(|_| PathBuf::from("agent-root-runner")),
-        )
-        .arg("tray")
-        .spawn();
+        let exe = std::env::current_exe().unwrap_or_else(|_| PathBuf::from("agent-root-runner"));
+        if let Err(e) = Command::new(exe).arg("tray").spawn() {
+            eprintln!("Warning: failed to spawn tray indicator: {e}");
+        }
     }
 }
 
@@ -252,36 +272,39 @@ impl ksni::Tray for RootRunnerTray {
                 .into(),
             );
         } else {
+            let sock_5 = self.socket.clone();
             items.push(
                 StandardItem {
                     label: "ARM (5 minutes)".into(),
                     icon_name: "security-high".into(),
-                    activate: Box::new(|_| {
-                        spawn_arm(&["--duration", "300"]);
+                    activate: Box::new(move |_| {
+                        spawn_arm(&sock_5, &["--duration", "300"]);
                     }),
                     ..Default::default()
                 }
                 .into(),
             );
 
+            let sock_15 = self.socket.clone();
             items.push(
                 StandardItem {
                     label: "ARM (15 minutes)".into(),
                     icon_name: "security-high".into(),
-                    activate: Box::new(|_| {
-                        spawn_arm(&["--duration", "900"]);
+                    activate: Box::new(move |_| {
+                        spawn_arm(&sock_15, &["--duration", "900"]);
                     }),
                     ..Default::default()
                 }
                 .into(),
             );
 
+            let sock_forever = self.socket.clone();
             items.push(
                 StandardItem {
                     label: "ARM (Forever)".into(),
                     icon_name: "security-high".into(),
-                    activate: Box::new(|_| {
-                        spawn_arm(&["--forever"]);
+                    activate: Box::new(move |_| {
+                        spawn_arm(&sock_forever, &["--forever"]);
                     }),
                     ..Default::default()
                 }
@@ -307,9 +330,16 @@ impl ksni::Tray for RootRunnerTray {
     }
 }
 
-fn spawn_arm(extra_args: &[&str]) {
-    let mut args = vec!["agent-root-runner", "arm"];
-    args.extend_from_slice(extra_args);
+fn spawn_arm(socket: &Path, extra_args: &[&str]) {
+    let mut args = vec!["agent-root-runner".to_string()];
+    if socket != Path::new("/run/agent-root-runner/runner.sock") {
+        args.push("--socket".to_string());
+        args.push(socket.to_string_lossy().into_owned());
+    }
+    args.push("arm".to_string());
+    for arg in extra_args {
+        args.push(arg.to_string());
+    }
     let _ = Command::new("pkexec").args(&args).spawn();
 }
 
@@ -344,9 +374,16 @@ pub fn run_tray(socket: &Path) -> Result<i32, String> {
                     tray.available = true;
                     tray.armed = res["is_armed"].as_bool().unwrap_or(false);
                     tray.forever = res["forever"].as_bool().unwrap_or(false);
-                    tray.remaining_seconds = res["remaining_seconds"].as_u64();
+                    tray.remaining_seconds =
+                        res["remaining_seconds"].as_f64().map(|v| v.round() as u64);
                     tray.quota_remaining = res["quota_remaining"].as_u64();
                     tray.commands_executed = res["commands_executed"].as_u64().unwrap_or(0);
+                } else {
+                    tray.available = false;
+                    tray.armed = false;
+                    tray.forever = false;
+                    tray.remaining_seconds = None;
+                    tray.quota_remaining = None;
                 }
             }
             Err(_) => {

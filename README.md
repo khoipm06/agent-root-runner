@@ -153,7 +153,7 @@ The repository provides a system tray indicator to monitor daemon status, ARM (w
 agent-root-runner tray
 ```
 
-- **Cross-desktop**: Registers as a standard FreeDesktop StatusNotifierItem (SNI / AppIndicator), appearing automatically in the system tray on both KDE Plasma and GNOME without manual desktop widget placement.
+- **Cross-desktop**: Registers as a standard FreeDesktop StatusNotifierItem (SNI / AppIndicator), appearing automatically in the system tray on KDE Plasma, and on GNOME when a compatible AppIndicator extension (such as `AppIndicator and KStatusNotifierItem Support`) is enabled.
 - **Idempotent**: Safe to run repeatedly; if an instance is already running for the current user, subsequent calls exit immediately with code `0`.
 - **Automatic on ARM**: Running `agent-root-runner arm` checks whether the indicator is active and launches it if missing.
 
