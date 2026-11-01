@@ -2,6 +2,7 @@ mod audit;
 mod executor;
 mod guardrails;
 mod state;
+mod tray;
 
 use audit::{AuditLogger, object};
 use clap::{Args, Parser, Subcommand};
@@ -91,6 +92,8 @@ enum Commands {
     },
     Exec(ExecArgs),
     Mcp,
+    #[command(about = "Run the desktop system tray indicator")]
+    Tray,
 }
 #[derive(Args)]
 struct ExecArgs {
@@ -141,7 +144,11 @@ fn run() -> Result<i32, String> {
             if let Some(q) = quota {
                 p.insert("quota".into(), json!(q));
             }
-            management(cli.socket.as_deref(), "arm", p)
+            let res = management(cli.socket.as_deref(), "arm", p)?;
+            if res == 0 {
+                tray::ensure_tray_running();
+            }
+            Ok(res)
         }
         Commands::Disarm => management(cli.socket.as_deref(), "disarm", Map::new()),
         Commands::Install => install(),
@@ -156,6 +163,7 @@ fn run() -> Result<i32, String> {
         ),
         Commands::Exec(args) => exec_cli(cli.socket.as_deref(), args),
         Commands::Mcp => mcp(cli.socket.as_deref()),
+        Commands::Tray => tray::run_tray(&resolve_socket(cli.socket.as_deref())),
     }
 }
 
@@ -1527,6 +1535,18 @@ fn mcp_call(id: Value, params: &Map<String, Value>, socket: &Path) -> Value {
 const UNIT_PATH: &str = "/etc/systemd/system/agent-root-runner.service";
 const BIN_PATH: &str = "/usr/local/bin/agent-root-runner";
 const MANIFEST_PATH: &str = "/etc/agent-root-runner/installed-files";
+const AUTOSTART_PATH: &str = "/etc/xdg/autostart/agent-root-runner-tray.desktop";
+
+const AUTOSTART_DESKTOP: &str = r#"[Desktop Entry]
+Type=Application
+Name=Agent Root Runner Tray
+Comment=System tray indicator for Agent Root Runner
+Exec=/usr/local/bin/agent-root-runner tray
+Icon=security-high
+Terminal=false
+Categories=Utility;
+"#;
+
 fn install() -> Result<i32, String> {
     if unsafe { libc::geteuid() } != 0 {
         return Err("install requires root. Run with sudo.".into());
@@ -1554,13 +1574,21 @@ fn install() -> Result<i32, String> {
             "Installed systemd unit: {UNIT_PATH} (no admin group found; socket is root-only)"
         ),
     }
+
+    let autostart = Path::new(AUTOSTART_PATH);
+    if let Some(parent) = autostart.parent() {
+        fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+    }
+    write_secure(autostart, AUTOSTART_DESKTOP.as_bytes(), 0o644)?;
+    println!("Installed autostart desktop entry: {AUTOSTART_PATH}");
+
     let mpath = Path::new(MANIFEST_PATH);
     if let Some(parent) = mpath.parent() {
         fs::create_dir_all(parent).map_err(|e| e.to_string())?;
     }
     write_secure(
         mpath,
-        format!("{BIN_PATH}\n{UNIT_PATH}\n").as_bytes(),
+        format!("{BIN_PATH}\n{UNIT_PATH}\n{AUTOSTART_PATH}\n").as_bytes(),
         0o600,
     )?;
     if source != dest {
@@ -1645,6 +1673,16 @@ fn uninstall() -> Result<i32, String> {
             Err(e) => {
                 incomplete = true;
                 eprintln!("Warning: could not remove {BIN_PATH}: {e}");
+            }
+        }
+    }
+    if untracked || manifest.lines().any(|x| x == AUTOSTART_PATH) {
+        match fs::remove_file(AUTOSTART_PATH) {
+            Ok(()) => println!("Removed: {AUTOSTART_PATH}"),
+            Err(e) if e.kind() == io::ErrorKind::NotFound => (),
+            Err(e) => {
+                incomplete = true;
+                eprintln!("Warning: could not remove {AUTOSTART_PATH}: {e}");
             }
         }
     }

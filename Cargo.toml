@@ -12,6 +12,7 @@ path = "src/main.rs"
 [dependencies]
 chrono = "0.4"
 clap = { version = "4.5", features = ["derive"] }
+ksni = { version = "0.3.7", features = ["async-io", "blocking"], default-features = false }
 libc = "0.2"
 regex = "1.11"
 serde_json = "1"
