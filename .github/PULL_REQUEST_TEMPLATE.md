@@ -19,7 +19,7 @@ Commands/results:
 
 - [ ] No change to privilege/authentication/ARM/guardrail behavior, or the security impact is explained below.
 - [ ] No secrets, credentials, or sensitive host data are included in this PR.
-- [ ] CLI, daemon/systemd, MCP, installer, and Plasma behavior remain compatible where applicable.
+- [ ] CLI, daemon/systemd, MCP, installer, and tray indicator behavior remain compatible where applicable.
 
 Notes for reviewers:
 

@@ -2,6 +2,7 @@ mod audit;
 mod executor;
 mod guardrails;
 mod state;
+mod tray;
 
 use audit::{AuditLogger, object};
 use clap::{Args, Parser, Subcommand};
@@ -91,6 +92,8 @@ enum Commands {
     },
     Exec(ExecArgs),
     Mcp,
+    #[command(about = "Run the desktop system tray indicator")]
+    Tray,
 }
 #[derive(Args)]
 struct ExecArgs {
@@ -141,7 +144,11 @@ fn run() -> Result<i32, String> {
             if let Some(q) = quota {
                 p.insert("quota".into(), json!(q));
             }
-            management(cli.socket.as_deref(), "arm", p)
+            let res = management(cli.socket.as_deref(), "arm", p)?;
+            if res == 0 {
+                tray::ensure_tray_running();
+            }
+            Ok(res)
         }
         Commands::Disarm => management(cli.socket.as_deref(), "disarm", Map::new()),
         Commands::Install => install(),
@@ -156,6 +163,7 @@ fn run() -> Result<i32, String> {
         ),
         Commands::Exec(args) => exec_cli(cli.socket.as_deref(), args),
         Commands::Mcp => mcp(cli.socket.as_deref()),
+        Commands::Tray => tray::run_tray(&resolve_socket(cli.socket.as_deref())),
     }
 }
 
@@ -1527,6 +1535,18 @@ fn mcp_call(id: Value, params: &Map<String, Value>, socket: &Path) -> Value {
 const UNIT_PATH: &str = "/etc/systemd/system/agent-root-runner.service";
 const BIN_PATH: &str = "/usr/local/bin/agent-root-runner";
 const MANIFEST_PATH: &str = "/etc/agent-root-runner/installed-files";
+const AUTOSTART_PATH: &str = "/etc/xdg/autostart/agent-root-runner-tray.desktop";
+
+const AUTOSTART_DESKTOP: &str = r#"[Desktop Entry]
+Type=Application
+Name=Agent Root Runner Tray
+Comment=System tray indicator for Agent Root Runner
+Exec=/usr/local/bin/agent-root-runner tray
+Icon=security-high
+Terminal=false
+Categories=Utility;
+"#;
+
 fn install() -> Result<i32, String> {
     if unsafe { libc::geteuid() } != 0 {
         return Err("install requires root. Run with sudo.".into());
@@ -1554,13 +1574,39 @@ fn install() -> Result<i32, String> {
             "Installed systemd unit: {UNIT_PATH} (no admin group found; socket is root-only)"
         ),
     }
+
+    let autostart = Path::new(AUTOSTART_PATH);
+    if let Some(parent) = autostart.parent() {
+        fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+    }
+    write_secure(autostart, AUTOSTART_DESKTOP.as_bytes(), 0o644)?;
+    println!("Installed autostart desktop entry: {AUTOSTART_PATH}");
+
+    // XDG gives a same-named per-user autostart entry precedence over the
+    // system one. A stale `~/.config/autostart` copy (for example an older
+    // `Exec=agent-root-runner tray` that resolves through a login PATH which
+    // lacks the upgraded binary) would silently shadow the entry installed
+    // above and fail at login. Rewrite the invoking user's copy to the
+    // canonical absolute-path content so the session always launches
+    // /usr/local/bin/agent-root-runner.
+    if let Some(home) = invoking_user_home() {
+        let user_entry = home.join(".config/autostart/agent-root-runner-tray.desktop");
+        if user_entry.exists() {
+            write_secure(&user_entry, AUTOSTART_DESKTOP.as_bytes(), 0o644)?;
+            println!(
+                "Refreshed shadowing per-user autostart entry: {}",
+                user_entry.display()
+            );
+        }
+    }
+
     let mpath = Path::new(MANIFEST_PATH);
     if let Some(parent) = mpath.parent() {
         fs::create_dir_all(parent).map_err(|e| e.to_string())?;
     }
     write_secure(
         mpath,
-        format!("{BIN_PATH}\n{UNIT_PATH}\n").as_bytes(),
+        format!("{BIN_PATH}\n{UNIT_PATH}\n{AUTOSTART_PATH}\n").as_bytes(),
         0o600,
     )?;
     if source != dest {
@@ -1602,6 +1648,19 @@ fn group_exists(name: &str) -> bool {
         Ok(c) => unsafe { !libc::getgrnam(c.as_ptr()).is_null() },
         Err(_) => false,
     }
+}
+/// Home directory of the `sudo`-invoking user, when `install` runs through
+/// sudo. Used only to reconcile a per-user autostart entry that would shadow
+/// the system one. `None` for a direct root login (no per-user entry to fix).
+fn invoking_user_home() -> Option<PathBuf> {
+    let user = std::env::var("SUDO_USER").ok().filter(|u| u != "root")?;
+    let name = std::ffi::CString::new(user).ok()?;
+    let passwd = unsafe { libc::getpwnam(name.as_ptr()) };
+    if passwd.is_null() || unsafe { (*passwd).pw_dir }.is_null() {
+        return None;
+    }
+    let home = unsafe { std::ffi::CStr::from_ptr((*passwd).pw_dir) };
+    Some(PathBuf::from(home.to_string_lossy().into_owned()))
 }
 /// The checked-in unit intentionally carries no `Group=` line; the installer
 /// appends one only when a portable admin group exists on the target host.
@@ -1645,6 +1704,16 @@ fn uninstall() -> Result<i32, String> {
             Err(e) => {
                 incomplete = true;
                 eprintln!("Warning: could not remove {BIN_PATH}: {e}");
+            }
+        }
+    }
+    if untracked || manifest.lines().any(|x| x == AUTOSTART_PATH) {
+        match fs::remove_file(AUTOSTART_PATH) {
+            Ok(()) => println!("Removed: {AUTOSTART_PATH}"),
+            Err(e) if e.kind() == io::ErrorKind::NotFound => (),
+            Err(e) => {
+                incomplete = true;
+                eprintln!("Warning: could not remove {AUTOSTART_PATH}: {e}");
             }
         }
     }
@@ -2075,6 +2144,18 @@ mod socket_parent_tests {
                 "admin_group must not miss an existing admin group"
             ),
         }
+    }
+
+    #[test]
+    fn autostart_entry_launches_the_absolute_binary_path() {
+        // A bare `Exec=agent-root-runner` resolves through the desktop session
+        // PATH, which on login lacked ~/.local/bin and hit a stale binary that
+        // predated the tray subcommand. The entry must be absolute.
+        let exec = AUTOSTART_DESKTOP
+            .lines()
+            .find(|line| line.starts_with("Exec="))
+            .expect("autostart entry must define Exec=");
+        assert_eq!(exec, "Exec=/usr/local/bin/agent-root-runner tray");
     }
 
     #[test]
