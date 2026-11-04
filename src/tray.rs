@@ -331,7 +331,12 @@ impl ksni::Tray for RootRunnerTray {
 }
 
 fn spawn_arm(socket: &Path, extra_args: &[&str]) {
-    let mut args = vec!["agent-root-runner".to_string()];
+    // pkexec resolves its command against root's secure PATH, not the desktop
+    // session's, so a bare name can hit a stale /usr/local/bin binary that
+    // predates `tray`/`arm`. Pin the running executable's absolute path.
+    let exe = std::env::current_exe()
+        .unwrap_or_else(|_| PathBuf::from("/usr/local/bin/agent-root-runner"));
+    let mut args = vec![exe.to_string_lossy().into_owned()];
     if socket != Path::new("/run/agent-root-runner/runner.sock") {
         args.push("--socket".to_string());
         args.push(socket.to_string_lossy().into_owned());

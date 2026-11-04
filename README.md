@@ -209,7 +209,8 @@ intend to authorize those payloads.
 sudo agent-root-runner uninstall
 ```
 
-Removes the unit, stops the service, and deletes the installed binary.
+Removes the unit and the tray autostart entry, stops the service, and deletes
+the installed binary.
 
 ## License
 
