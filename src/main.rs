@@ -279,10 +279,10 @@ fn log_cli(path: Option<&Path>, limit: usize) -> Result<i32, String> {
     for line in lines {
         if let Ok(val) = serde_json::from_str::<Value>(line) {
             let ts = val["timestamp"].as_str().unwrap_or("");
-            let event = val["event"].as_str().unwrap_or("UNKNOWN");
-            let cmd = val["data"]["command"].as_str().unwrap_or("");
-            let exit_code = val["data"]["exit_code"].as_i64();
-            let decision = val["data"]["decision"].as_str();
+            let event = val["event_type"].as_str().unwrap_or("UNKNOWN");
+            let cmd = val["command"].as_str().unwrap_or("");
+            let exit_code = val["exit_code"].as_i64();
+            let decision = val["decision"].as_str();
 
             let mut details = String::new();
             if !cmd.is_empty() {
@@ -436,15 +436,22 @@ fn strip_leading_sudo_argv(args: &[String]) -> &[String] {
     if args.is_empty() {
         return args;
     }
-    if args[0] == "sudo" {
-        if args.len() > 1 && (args[1] == "-E" || args[1] == "--") {
-            &args[2..]
-        } else {
-            &args[1..]
-        }
-    } else {
-        args
+    if args[0] != "sudo" {
+        return args;
     }
+    let mut index = 1;
+    while let Some(option) = args.get(index).map(String::as_str) {
+        match option {
+            "--" => {
+                index += 1;
+                break;
+            }
+            "-E" | "-H" | "-n" | "-S" | "-b" | "-P" => index += 1,
+            opt if opt.starts_with('-') => return &args[..0],
+            _ => break,
+        }
+    }
+    &args[index..]
 }
 
 fn strip_leading_sudo(cmd: &str) -> &str {
@@ -452,22 +459,36 @@ fn strip_leading_sudo(cmd: &str) -> &str {
     if trimmed == "sudo" {
         return "";
     }
-    if let Some(rest) = trimmed.strip_prefix("sudo -E ") {
-        rest.trim_start()
-    } else if let Some(rest) = trimmed.strip_prefix("sudo -- ") {
-        rest.trim_start()
-    } else if let Some(rest) = trimmed.strip_prefix("sudo ") {
-        rest.trim_start()
-    } else {
-        trimmed
+    let Some(rest) = trimmed.strip_prefix("sudo ") else {
+        return trimmed;
+    };
+    let words: Vec<&str> = rest.split_whitespace().collect();
+    let mut index = 0;
+    while let Some(option) = words.get(index).copied() {
+        match option {
+            "--" => {
+                index += 1;
+                break;
+            }
+            "-E" | "-H" | "-n" | "-S" | "-b" | "-P" => index += 1,
+            opt if opt.starts_with('-') => return "",
+            _ => break,
+        }
     }
+    let offset = words[..index].iter().map(|w| w.len() + 1).sum::<usize>();
+    rest[offset..].trim_start()
 }
 
 fn exec_cli(path: Option<&Path>, args: ExecArgs) -> Result<i32, String> {
     if !(1..=3600).contains(&args.timeout) {
         return Err("--timeout must be in range 1..3600".into());
     }
-    let command = shell_join(strip_leading_sudo_argv(&args.command));
+    let command_args = strip_leading_sudo_argv(&args.command);
+    if command_args.is_empty() {
+        eprintln!("Error: unsupported sudo option or missing command");
+        return Ok(2);
+    }
+    let command = shell_join(command_args);
     let mut env = Map::new();
     for item in args.env {
         if let Some((k, v)) = item.split_once('=') {
@@ -1025,6 +1046,18 @@ impl Daemon {
                 rpc_result(id, s)
             }
             "arm" => self.arm_rpc(id, params, p),
+            "extend" => {
+                let seconds = params.get("seconds").and_then(Value::as_u64).unwrap_or(0);
+                match self.state.extend(seconds, p.uid, p.pid) {
+                    Ok(result) => rpc_result(id, result),
+                    Err(error) => rpc_error(
+                        id,
+                        error.code,
+                        error.message,
+                        error.reason.map(|reason| json!({"reason": reason})),
+                    ),
+                }
+            }
             "disarm" => match self.state.disarm(p.uid) {
                 Ok(result) => rpc_result(id, result),
                 Err(error) => rpc_error(
@@ -1039,7 +1072,15 @@ impl Daemon {
             _ => rpc_error(id, -32601, format!("Method '{method}' not found"), None),
         }
     }
-    fn logs_rpc(&self, id: Value, pms: Map<String, Value>, _p: &Peer) -> Value {
+    fn logs_rpc(&self, id: Value, pms: Map<String, Value>, p: &Peer) -> Value {
+        if p.uid != 0 {
+            return rpc_error(
+                id,
+                -32003,
+                "Permission denied: audit logs require root privileges",
+                None,
+            );
+        }
         let limit = match pms.get("limit") {
             None => 20,
             Some(Value::Number(n)) => n.as_u64().unwrap_or(20) as usize,
@@ -2375,6 +2416,11 @@ mod socket_parent_tests {
             "systemctl restart nginx"
         );
         assert_eq!(strip_leading_sudo("sudo"), "");
+        assert_eq!(
+            strip_leading_sudo("sudo -n systemctl restart foo"),
+            "systemctl restart foo"
+        );
+        assert_eq!(strip_leading_sudo("sudo -u root id"), "");
         assert_eq!(strip_leading_sudo(""), "");
 
         let argv1 = vec!["sudo".into(), "systemctl".into(), "restart".into()];
@@ -2385,6 +2431,15 @@ mod socket_parent_tests {
 
         let argv3 = vec!["ls".into(), "-la".into()];
         assert_eq!(strip_leading_sudo_argv(&argv3), &["ls", "-la"]);
+        let argv4 = vec![
+            "sudo".into(),
+            "-n".into(),
+            "systemctl".into(),
+            "restart".into(),
+        ];
+        assert_eq!(strip_leading_sudo_argv(&argv4), &["systemctl", "restart"]);
+        let argv5 = vec!["sudo".into(), "-u".into(), "root".into(), "id".into()];
+        assert!(strip_leading_sudo_argv(&argv5).is_empty());
     }
 
     #[test]
@@ -2409,6 +2464,10 @@ mod socket_parent_tests {
         let response = daemon.dispatch(&req, &peer);
         assert!(response["error"].is_null());
         assert!(response["result"]["lines"].is_array());
+        let mut unprivileged = peer.clone();
+        unprivileged.uid = 1000;
+        let denied = daemon.dispatch(&req, &unprivileged);
+        assert_eq!(denied["error"]["code"], -32003);
 
         fs::remove_dir_all(&root).unwrap();
     }

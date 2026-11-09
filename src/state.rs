@@ -110,6 +110,75 @@ impl StateMachine {
     pub fn audit(&self) -> &AuditLogger {
         &self.audit
     }
+    /// Adds time to the active finite session without resetting its quota.
+    pub fn extend(&self, extra_seconds: u64, uid: u32, pid: i32) -> Result<Value, RpcError> {
+        if uid != 0 {
+            return Err(RpcError::permission(format!(
+                "Permission denied: extending ARM requires root privileges (peer_uid == 0, got {uid})."
+            )));
+        }
+        if extra_seconds == 0 || extra_seconds > MAX_DURATION_SECONDS {
+            return Err(RpcError::invalid(
+                "extension must be within 1..=86400 seconds",
+            ));
+        }
+        let mut g = self
+            .inner
+            .lock()
+            .map_err(|_| RpcError::internal("state mutex poisoned"))?;
+        if g.audit_failed {
+            return Err(RpcError::internal(
+                "Audit logging previously failed; the daemon is fail-closed.",
+            ));
+        }
+        if g.in_flight {
+            return Err(RpcError::internal(
+                "Cannot extend while a command is executing.",
+            ));
+        }
+        if !g.armed {
+            return Err(RpcError::invalid("No active ARM session to extend"));
+        }
+        let (duration, added, sid, left) = {
+            let Some(session) = g.session.as_mut() else {
+                return Err(RpcError::invalid("No active ARM session to extend"));
+            };
+            let Some(duration) = session.duration else {
+                return Err(RpcError::invalid("Cannot extend an unlimited ARM session"));
+            };
+            let new_duration = duration
+                .saturating_add(extra_seconds)
+                .min(MAX_DURATION_SECONDS);
+            let added = new_duration.saturating_sub(duration);
+            session.duration = Some(new_duration);
+            session.mono += Duration::from_secs(added);
+            (new_duration, added, session.id.clone(), session.left)
+        };
+        let result = status_inner(&g);
+        if let Err(error) = self.emit_locked(
+            &mut g,
+            "ARM_EXTEND",
+            Some(pid),
+            Some(uid),
+            None,
+            None,
+            object(&[
+                ("session_id", json!(sid)),
+                ("extension_seconds", json!(added)),
+                ("duration_seconds", json!(duration)),
+                ("quota_remaining", json!(left)),
+            ]),
+        ) {
+            g.armed = false;
+            g.session = None;
+            drop(g);
+            self.kill();
+            return Err(RpcError::internal(format!(
+                "Cannot durably audit ARM extension; the daemon is fail-closed: {error}"
+            )));
+        }
+        Ok(result)
+    }
     pub fn arm(
         &self,
         duration: Option<u64>,
@@ -842,6 +911,19 @@ mod tests {
             p,
         )
     }
+    #[test]
+    fn extend_adds_to_deadline_without_resetting_quota_or_start_time() {
+        let (m, p) = machine();
+        let before = m.arm(Some(30), Some(4), false, 0, 1).unwrap();
+        let result = m.extend(10, 0, 2).unwrap();
+        assert_eq!(result["duration_seconds"], 40);
+        assert_eq!(result["quota_remaining"], 4);
+        assert_eq!(result["session_id"], before["session_id"]);
+        assert_eq!(result["armed_at"], before["armed_at"]);
+        assert_eq!(m.extend(10, 1000, 2).unwrap_err().code, -32003);
+        let _ = fs::remove_file(p);
+    }
+
     #[test]
     fn root_auth_duration_and_forever_contract() {
         let (m, p) = machine();

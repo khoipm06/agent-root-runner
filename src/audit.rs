@@ -123,6 +123,10 @@ impl AuditLogger {
 
     pub fn tail_lines(&self, n: usize) -> Result<Vec<String>, String> {
         use std::io::{BufRead, BufReader, Seek, SeekFrom};
+        let _writer = self
+            .file
+            .lock()
+            .map_err(|_| "audit mutex poisoned".to_string())?;
         let file = File::open(&self.path)
             .map_err(|e| format!("Cannot open audit log {}: {e}", self.path.display()))?;
         let mut reader = BufReader::new(file);
@@ -132,7 +136,10 @@ impl AuditLogger {
             let mut discard = String::new();
             let _ = reader.read_line(&mut discard);
         }
-        let lines: Vec<String> = reader.lines().filter_map(|l| l.ok()).collect();
+        let mut lines = Vec::new();
+        for line in reader.lines() {
+            lines.push(line.map_err(|e| format!("Cannot read audit log: {e}"))?);
+        }
         let start = lines.len().saturating_sub(n);
         Ok(lines[start..].to_vec())
     }

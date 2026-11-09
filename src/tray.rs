@@ -265,7 +265,7 @@ impl ksni::Tray for RootRunnerTray {
                     label: "Extend ARM (+10 minutes)".into(),
                     icon_name: "document-revert".into(),
                     activate: Box::new(move |_| {
-                        spawn_arm(&sock_10, &["--duration", "600"]);
+                        extend_arm(&sock_10, 600);
                     }),
                     ..Default::default()
                 }
@@ -278,7 +278,7 @@ impl ksni::Tray for RootRunnerTray {
                     label: "Extend ARM (+15 minutes)".into(),
                     icon_name: "document-revert".into(),
                     activate: Box::new(move |_| {
-                        spawn_arm(&sock_15, &["--duration", "900"]);
+                        extend_arm(&sock_15, 900);
                     }),
                     ..Default::default()
                 }
@@ -354,6 +354,12 @@ impl ksni::Tray for RootRunnerTray {
 
         items
     }
+}
+
+fn extend_arm(socket: &Path, seconds: u64) {
+    let mut params = Map::new();
+    params.insert("seconds".into(), serde_json::json!(seconds));
+    let _ = crate::rpc(socket, "extend", params, Duration::from_secs(5));
 }
 
 fn spawn_arm(socket: &Path, extra_args: &[&str]) {

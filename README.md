@@ -91,8 +91,8 @@ sudo agent-root-runner arm --duration 600 --quota 20
 agent-root-runner status
 agent-root-runner status --json
 
-# View recent audit logs without sudo
-agent-root-runner log --limit 20
+# View recent audit logs (requires root)
+sudo agent-root-runner log --limit 20
 
 # Run something as root
 agent-root-runner exec --workdir "$PWD" -- make install
