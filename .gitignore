@@ -1,28 +1,9 @@
-# Distribution / packaging
+# Rust build output
 /target/
-build/
-develop-eggs/
 dist/
-downloads/
-eggs/
-.eggs/
-lib/
-lib64/
-parts/
-sdist/
-var/
-wheels/
-*.egg-info/
-.installed.cfg
-*.egg
-*.spec
 
-# Virtual environments
+# Local environment
 .env
-.venv
-env/
-venv/
-ENV/
 
 # Temporary and backup files
 *.bak
@@ -38,6 +19,3 @@ ENV/
 /run/agent-root-runner/
 audit.log
 *.log
-
-# Checkpoint tracking
-.git/repo-public-readiness-checkpoint

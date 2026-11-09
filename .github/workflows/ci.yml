@@ -56,12 +56,11 @@ jobs:
           ! ldd target/release/agent-root-runner | grep -i python
       - name: Smoke-test release executable
         run: cargo test --locked --release --test release_runtime
-      - name: Package release executable and Plasma applet
+      - name: Package release executable
         run: |
           mkdir -p dist
           install -m 0755 target/release/agent-root-runner dist/agent-root-runner
           tar -czf dist/agent-root-runner-linux-x86_64.tar.gz -C dist agent-root-runner
-          (cd plasma-applet && zip -qr ../dist/agent-root-runner-plasma-applet.zip metadata.json contents)
       - name: Upload artifacts
         uses: actions/upload-artifact@v4
         with:
@@ -69,7 +68,6 @@ jobs:
           path: |
             dist/agent-root-runner
             dist/agent-root-runner-linux-x86_64.tar.gz
-            dist/agent-root-runner-plasma-applet.zip
 
   publish-release:
     name: Publish tagged release
@@ -89,5 +87,4 @@ jobs:
         with:
           files: |
             dist/agent-root-runner-linux-x86_64.tar.gz
-            dist/agent-root-runner-plasma-applet.zip
             dist/agent-root-runner

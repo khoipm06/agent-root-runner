@@ -64,7 +64,7 @@ sudo ./target/release/agent-root-runner install
 
 `install` copies the binary to `/usr/local/bin`, writes
 `/etc/systemd/system/agent-root-runner.service`, enables it, and starts the
-daemon. It also adds the first admin group it finds (`wheel`, then `sudo`, then
+daemon. It also adds a desktop autostart entry (`/etc/xdg/autostart/agent-root-runner-tray.desktop`) so the system tray indicator starts automatically with your graphical session. It also adds the first admin group it finds (`wheel`, then `sudo`, then
 `adm`) to the unit so that group can reach the socket. If none exists, the
 socket stays root-only.
 
@@ -74,7 +74,8 @@ Default paths:
 |---|---|
 | Socket | `/run/agent-root-runner/runner.sock` |
 | Audit log | `/var/log/agent-root-runner/audit.log` |
-| Unit | `/etc/systemd/system/agent-root-runner.service` |
+| Daemon unit | `/etc/systemd/system/agent-root-runner.service` |
+| Tray autostart | `/etc/xdg/autostart/agent-root-runner-tray.desktop` |
 | Binary | `/usr/local/bin/agent-root-runner` |
 
 Every command accepts `--socket <path>` to override the socket, which is handy
@@ -116,17 +117,23 @@ Put `--` before the command so its own flags are not parsed by the runner.
 
 ## Use from an AI agent
 
-MCP (stdio) is the simplest integration. Register the server with your agent:
+MCP (stdio) is the simplest integration. Register the server directly with your agent harness via CLI command instead of editing configuration files manually:
 
-```json
-{
-  "mcpServers": {
-    "agent-root-runner": {
-      "command": "agent-root-runner",
-      "args": ["mcp"]
-    }
-  }
-}
+```bash
+# Antigravity CLI
+agy mcp add agent-root-runner agent-root-runner mcp
+
+# Claude Code CLI
+claude mcp add agent-root-runner -- agent-root-runner mcp
+
+# Codex CLI
+codex mcp add agent-root-runner -- agent-root-runner mcp
+
+# OpenCode CLI
+opencode mcp add agent-root-runner -- agent-root-runner mcp
+
+# Pi CLI
+pi mcp add agent-root-runner -- agent-root-runner mcp
 ```
 
 It exposes one tool, `run_privileged_command`, which returns the command's exit
@@ -137,6 +144,18 @@ Agents can also shell out directly:
 ```bash
 agent-root-runner exec --workdir "$PWD" -- <command...>
 ```
+
+## System tray indicator
+
+The repository provides a system tray indicator to monitor daemon status, ARM (with optional quotas or forever mode), and Disarm directly from the system tray:
+
+```bash
+agent-root-runner tray
+```
+
+- **Cross-desktop**: Registers as a standard FreeDesktop StatusNotifierItem (SNI / AppIndicator), appearing automatically in the system tray on KDE Plasma, and on GNOME when a compatible AppIndicator extension (such as `AppIndicator and KStatusNotifierItem Support`) is enabled.
+- **Idempotent**: Safe to run repeatedly; if an instance is already running for the current user, subsequent calls exit immediately with code `0`.
+- **Automatic on ARM**: Running `agent-root-runner arm` checks whether the indicator is active and launches it if missing.
 
 ## Exit codes
 
@@ -190,7 +209,8 @@ intend to authorize those payloads.
 sudo agent-root-runner uninstall
 ```
 
-Removes the unit, stops the service, and deletes the installed binary.
+Removes the unit and the tray autostart entry, stops the service, and deletes
+the installed binary.
 
 ## License
 
