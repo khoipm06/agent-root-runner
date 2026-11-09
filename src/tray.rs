@@ -259,6 +259,32 @@ impl ksni::Tray for RootRunnerTray {
         items.push(MenuItem::Separator);
 
         if self.armed {
+            let sock_10 = self.socket.clone();
+            items.push(
+                StandardItem {
+                    label: "Extend ARM (+10 minutes)".into(),
+                    icon_name: "document-revert".into(),
+                    activate: Box::new(move |_| {
+                        spawn_arm(&sock_10, &["--duration", "600"]);
+                    }),
+                    ..Default::default()
+                }
+                .into(),
+            );
+
+            let sock_15 = self.socket.clone();
+            items.push(
+                StandardItem {
+                    label: "Extend ARM (+15 minutes)".into(),
+                    icon_name: "document-revert".into(),
+                    activate: Box::new(move |_| {
+                        spawn_arm(&sock_15, &["--duration", "900"]);
+                    }),
+                    ..Default::default()
+                }
+                .into(),
+            );
+
             let sock = self.socket.clone();
             items.push(
                 StandardItem {
@@ -348,6 +374,21 @@ fn spawn_arm(socket: &Path, extra_args: &[&str]) {
     let _ = Command::new("pkexec").args(&args).spawn();
 }
 
+fn send_desktop_notification(summary: &str, body: &str, urgency: &str) {
+    let _ = Command::new("notify-send")
+        .args([
+            "-a",
+            "Agent Root Runner",
+            "-u",
+            urgency,
+            "-i",
+            "security-high",
+            summary,
+            body,
+        ])
+        .spawn();
+}
+
 pub fn run_tray(socket: &Path) -> Result<i32, String> {
     let _lock = match try_acquire_tray_lock()? {
         Some(lock) => lock,
@@ -365,6 +406,9 @@ pub fn run_tray(socket: &Path) -> Result<i32, String> {
 
     println!("Agent Root Runner system tray indicator started.");
 
+    let mut notified_session_id: Option<String> = None;
+    let mut notified_expiry = false;
+
     let sock = socket.to_path_buf();
     loop {
         if handle.is_closed() {
@@ -372,6 +416,32 @@ pub fn run_tray(socket: &Path) -> Result<i32, String> {
         }
 
         let resp = crate::rpc(&sock, "status", Map::new(), Duration::from_secs(2));
+
+        if let Ok(v) = &resp {
+            if let Some(res) = v.get("result") {
+                let is_armed = res["is_armed"].as_bool().unwrap_or(false);
+                let session_id = res["session_id"].as_str().map(|s| s.to_string());
+                if session_id != notified_session_id {
+                    notified_session_id = session_id;
+                    notified_expiry = false;
+                }
+
+                if is_armed && !res["forever"].as_bool().unwrap_or(false) {
+                    if let Some(rem) = res["remaining_seconds"].as_f64() {
+                        if rem <= 60.0 && !notified_expiry {
+                            send_desktop_notification(
+                                "Agent Root Runner: ARM Expiring Soon",
+                                "Privileged access will expire in less than 1 minute. Click tray to extend.",
+                                "critical",
+                            );
+                            notified_expiry = true;
+                        } else if rem > 60.0 {
+                            notified_expiry = false;
+                        }
+                    }
+                }
+            }
+        }
 
         let updated = handle.update(|tray| match resp {
             Ok(v) => {
