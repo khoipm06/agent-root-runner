@@ -137,7 +137,9 @@ pi mcp add agent-root-runner -- agent-root-runner mcp
 ```
 
 It exposes one tool, `run_privileged_command`, which returns the command's exit
-code, stdout and stderr. The daemon must be armed, or the call fails.
+code, stdout and stderr. The daemon must be armed, or the call fails. Agents
+should call this tool instead of attempting to run `sudo` in interactive shell
+environments; any accidental leading `sudo` prefix is automatically stripped.
 
 Agents can also shell out directly:
 

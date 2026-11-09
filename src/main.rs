@@ -356,11 +356,42 @@ fn shell_quote(word: &str) -> String {
     }
 }
 
+fn strip_leading_sudo_argv(args: &[String]) -> &[String] {
+    if args.is_empty() {
+        return args;
+    }
+    if args[0] == "sudo" {
+        if args.len() > 1 && (args[1] == "-E" || args[1] == "--") {
+            &args[2..]
+        } else {
+            &args[1..]
+        }
+    } else {
+        args
+    }
+}
+
+fn strip_leading_sudo(cmd: &str) -> &str {
+    let trimmed = cmd.trim();
+    if trimmed == "sudo" {
+        return "";
+    }
+    if let Some(rest) = trimmed.strip_prefix("sudo -E ") {
+        rest.trim_start()
+    } else if let Some(rest) = trimmed.strip_prefix("sudo -- ") {
+        rest.trim_start()
+    } else if let Some(rest) = trimmed.strip_prefix("sudo ") {
+        rest.trim_start()
+    } else {
+        trimmed
+    }
+}
+
 fn exec_cli(path: Option<&Path>, args: ExecArgs) -> Result<i32, String> {
     if !(1..=3600).contains(&args.timeout) {
         return Err("--timeout must be in range 1..3600".into());
     }
-    let command = shell_join(&args.command);
+    let command = shell_join(strip_leading_sudo_argv(&args.command));
     let mut env = Map::new();
     for item in args.env {
         if let Some((k, v)) = item.split_once('=') {
@@ -1420,7 +1451,43 @@ fn mcp_handle_line(line: &str, socket: &Path) -> Option<Value> {
     response
 }
 fn tools_schema() -> Value {
-    json!({"tools":[{"name":"run_privileged_command","description":"Execute a shell command with root privileges via the agent-root-runner daemon. Requires the daemon to be armed (sudo agent-root-runner arm).","inputSchema":{"type":"object","properties":{"command":{"type":"string","description":"Shell command to execute (e.g. 'smartctl -a /dev/nvme0n1', 'systemctl restart nginx')"},"timeout":{"type":"integer","description":"Command timeout in seconds (default: 60)","default":60,"minimum":1,"maximum":3600},"workdir":{"type":"string","description":"Working directory (default: /)","default":"/"},"env":{"type":"object","description":"Additional environment variables","additionalProperties":{"type":"string"}}},"required":["command"]}}]})
+    json!({
+        "tools": [
+            {
+                "name": "run_privileged_command",
+                "description": "Execute a shell command with root/superuser privileges via the agent-root-runner daemon. ALWAYS use this tool instead of running 'sudo' in bash or shell execution tools. Trigger this tool whenever a task requires root, administrative privileges, package installation (apt, dnf, pacman), service management (systemctl), filesystem operations (mount, umount), or privileged diagnostics (dmesg, journalctl, smartctl). The daemon must be armed by the operator. Pass the command directly without prefixing 'sudo'.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "command": {
+                            "type": "string",
+                            "description": "Shell command to execute with root privileges (e.g. 'dnf install -y nginx', 'systemctl restart nginx', 'smartctl -a /dev/nvme0n1'). Do not prefix with 'sudo'."
+                        },
+                        "timeout": {
+                            "type": "integer",
+                            "description": "Command timeout in seconds (default: 60)",
+                            "default": 60,
+                            "minimum": 1,
+                            "maximum": 3600
+                        },
+                        "workdir": {
+                            "type": "string",
+                            "description": "Working directory (default: /)",
+                            "default": "/"
+                        },
+                        "env": {
+                            "type": "object",
+                            "description": "Additional environment variables",
+                            "additionalProperties": {
+                                "type": "string"
+                            }
+                        }
+                    },
+                    "required": ["command"]
+                }
+            }
+        ]
+    })
 }
 fn mcp_call(id: Value, params: &Map<String, Value>, socket: &Path) -> Value {
     let name = params.get("name").and_then(Value::as_str).unwrap_or("");
@@ -1436,7 +1503,7 @@ fn mcp_call(id: Value, params: &Map<String, Value>, socket: &Path) -> Value {
             None,
         );
     };
-    let Some(command) = args
+    let Some(raw_command) = args
         .get("command")
         .and_then(Value::as_str)
         .filter(|x| !x.is_empty())
@@ -1448,6 +1515,15 @@ fn mcp_call(id: Value, params: &Map<String, Value>, socket: &Path) -> Value {
             None,
         );
     };
+    let command = strip_leading_sudo(raw_command);
+    if command.is_empty() {
+        return rpc_error(
+            id,
+            -32602,
+            "Missing or invalid required argument: command",
+            None,
+        );
+    }
     let timeout = match args.get("timeout") {
         None => 60,
         Some(value) => match value.as_u64() {
@@ -2188,5 +2264,37 @@ mod socket_parent_tests {
         );
         assert_eq!(disarmed["error"]["code"], -32001);
         assert_eq!(disarmed["error"]["data"]["reason"], "DISARMED");
+    }
+
+    #[test]
+    fn strip_leading_sudo_removes_prefix_correctly() {
+        assert_eq!(
+            strip_leading_sudo("sudo dnf install -y nginx"),
+            "dnf install -y nginx"
+        );
+        assert_eq!(
+            strip_leading_sudo("sudo -E systemctl restart foo"),
+            "systemctl restart foo"
+        );
+        assert_eq!(
+            strip_leading_sudo("sudo -- smartctl -a /dev/sda"),
+            "smartctl -a /dev/sda"
+        );
+        assert_eq!(strip_leading_sudo("  sudo apt update  "), "apt update");
+        assert_eq!(
+            strip_leading_sudo("systemctl restart nginx"),
+            "systemctl restart nginx"
+        );
+        assert_eq!(strip_leading_sudo("sudo"), "");
+        assert_eq!(strip_leading_sudo(""), "");
+
+        let argv1 = vec!["sudo".into(), "systemctl".into(), "restart".into()];
+        assert_eq!(strip_leading_sudo_argv(&argv1), &["systemctl", "restart"]);
+
+        let argv2 = vec!["sudo".into(), "-E".into(), "dnf".into(), "upgrade".into()];
+        assert_eq!(strip_leading_sudo_argv(&argv2), &["dnf", "upgrade"]);
+
+        let argv3 = vec!["ls".into(), "-la".into()];
+        assert_eq!(strip_leading_sudo_argv(&argv3), &["ls", "-la"]);
     }
 }
