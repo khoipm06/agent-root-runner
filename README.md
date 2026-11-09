@@ -87,8 +87,12 @@ for testing against a non-system daemon.
 # Arm for 10 minutes, 20 commands
 sudo agent-root-runner arm --duration 600 --quota 20
 
-# Check state
+# Check state (text or JSON)
 agent-root-runner status
+agent-root-runner status --json
+
+# View recent audit logs without sudo
+agent-root-runner log --limit 20
 
 # Run something as root
 agent-root-runner exec --workdir "$PWD" -- make install

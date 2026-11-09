@@ -107,6 +107,9 @@ impl StateMachine {
             allow_user_arm,
         }
     }
+    pub fn audit(&self) -> &AuditLogger {
+        &self.audit
+    }
     pub fn arm(
         &self,
         duration: Option<u64>,

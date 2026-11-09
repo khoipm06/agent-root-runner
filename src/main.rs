@@ -61,7 +61,10 @@ struct Cli {
 }
 #[derive(Subcommand)]
 enum Commands {
-    Status,
+    Status {
+        #[arg(long, help = "Output status as JSON")]
+        json: bool,
+    },
     Arm {
         #[arg(
             long,
@@ -92,6 +95,15 @@ enum Commands {
     },
     Exec(ExecArgs),
     Mcp,
+    #[command(about = "View recent audit log entries from the daemon")]
+    Log {
+        #[arg(
+            long,
+            default_value_t = 20,
+            help = "Number of recent audit entries to display"
+        )]
+        limit: usize,
+    },
     #[command(about = "Run the desktop system tray indicator")]
     Tray,
 }
@@ -130,7 +142,7 @@ fn main() -> ExitCode {
 fn run() -> Result<i32, String> {
     let cli = Cli::parse();
     match cli.command {
-        Commands::Status => management(cli.socket.as_deref(), "status", Map::new()),
+        Commands::Status { json } => status_cli(cli.socket.as_deref(), json),
         Commands::Arm {
             duration,
             forever,
@@ -163,6 +175,7 @@ fn run() -> Result<i32, String> {
         ),
         Commands::Exec(args) => exec_cli(cli.socket.as_deref(), args),
         Commands::Mcp => mcp(cli.socket.as_deref()),
+        Commands::Log { limit } => log_cli(cli.socket.as_deref(), limit),
         Commands::Tray => tray::run_tray(&resolve_socket(cli.socket.as_deref())),
     }
 }
@@ -226,6 +239,69 @@ fn rpc(
     }
     serde_json::from_slice(&line).map_err(|e| format!("Malformed response from daemon: {e}"))
 }
+fn status_cli(path: Option<&Path>, json_output: bool) -> Result<i32, String> {
+    if json_output {
+        let socket = resolve_socket(path);
+        let resp = rpc(&socket, "status", Map::new(), Duration::from_secs(10))?;
+        if let Some(err) = resp.get("error") {
+            let msg = err["message"].as_str().unwrap_or("Unknown daemon error");
+            eprintln!("Error: {msg}");
+            return Ok(daemon_error_exit(err["code"].as_i64().unwrap_or(-32603)));
+        }
+        let result = resp.get("result").cloned().unwrap_or_else(|| json!({}));
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&result).unwrap_or_else(|_| "{}".into())
+        );
+        return Ok(0);
+    }
+    management(path, "status", Map::new())
+}
+
+fn log_cli(path: Option<&Path>, limit: usize) -> Result<i32, String> {
+    let socket = resolve_socket(path);
+    let mut params = Map::new();
+    params.insert("limit".into(), json!(limit));
+    let resp = rpc(&socket, "logs", params, Duration::from_secs(10))?;
+    if let Some(err) = resp.get("error") {
+        let msg = err["message"].as_str().unwrap_or("Unknown daemon error");
+        eprintln!("Error: {msg}");
+        return Ok(daemon_error_exit(err["code"].as_i64().unwrap_or(-32603)));
+    }
+    let lines = resp["result"]["lines"]
+        .as_array()
+        .map(|arr| arr.iter().filter_map(|v| v.as_str()).collect::<Vec<_>>())
+        .unwrap_or_default();
+    if lines.is_empty() {
+        println!("No audit records found.");
+        return Ok(0);
+    }
+    for line in lines {
+        if let Ok(val) = serde_json::from_str::<Value>(line) {
+            let ts = val["timestamp"].as_str().unwrap_or("");
+            let event = val["event"].as_str().unwrap_or("UNKNOWN");
+            let cmd = val["data"]["command"].as_str().unwrap_or("");
+            let exit_code = val["data"]["exit_code"].as_i64();
+            let decision = val["data"]["decision"].as_str();
+
+            let mut details = String::new();
+            if !cmd.is_empty() {
+                details.push_str(&format!(" cmd={cmd}"));
+            }
+            if let Some(dec) = decision {
+                details.push_str(&format!(" decision={dec}"));
+            }
+            if let Some(code) = exit_code {
+                details.push_str(&format!(" exit={code}"));
+            }
+            println!("[{ts}] {event}{details}");
+        } else {
+            println!("{line}");
+        }
+    }
+    Ok(0)
+}
+
 fn management(
     path: Option<&Path>,
     method: &str,
@@ -959,7 +1035,20 @@ impl Daemon {
                 ),
             },
             "exec" => self.exec_rpc(id, params, p),
+            "logs" => self.logs_rpc(id, params, p),
             _ => rpc_error(id, -32601, format!("Method '{method}' not found"), None),
+        }
+    }
+    fn logs_rpc(&self, id: Value, pms: Map<String, Value>, _p: &Peer) -> Value {
+        let limit = match pms.get("limit") {
+            None => 20,
+            Some(Value::Number(n)) => n.as_u64().unwrap_or(20) as usize,
+            _ => 20,
+        };
+        let limit = limit.clamp(1, 1000);
+        match self.state.audit().tail_lines(limit) {
+            Ok(lines) => rpc_result(id, json!({ "lines": lines })),
+            Err(e) => rpc_error(id, -32603, format!("Failed to read audit logs: {e}"), None),
         }
     }
     fn arm_rpc(&self, id: Value, pms: Map<String, Value>, p: &Peer) -> Value {
@@ -2296,5 +2385,31 @@ mod socket_parent_tests {
 
         let argv3 = vec!["ls".into(), "-la".into()];
         assert_eq!(strip_leading_sudo_argv(&argv3), &["ls", "-la"]);
+    }
+
+    #[test]
+    fn daemon_handles_logs_rpc_and_tail_lines() {
+        let root = std::env::temp_dir().join(format!(
+            "arr-logs-test-{}-{}",
+            std::process::id(),
+            uuid::Uuid::new_v4()
+        ));
+        fs::create_dir_all(&root).unwrap();
+        let audit = root.join("audit.log");
+        let (daemon, _state) = exec_rpc_test_daemon(&audit);
+        let peer = test_peer();
+
+        let req = json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "logs",
+            "params": { "limit": 5 }
+        })
+        .to_string();
+        let response = daemon.dispatch(&req, &peer);
+        assert!(response["error"].is_null());
+        assert!(response["result"]["lines"].is_array());
+
+        fs::remove_dir_all(&root).unwrap();
     }
 }

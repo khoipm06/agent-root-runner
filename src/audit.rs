@@ -13,6 +13,7 @@ use uuid::Uuid;
 pub const PROD_AUDIT_PATH: &str = "/var/log/agent-root-runner/audit.log";
 
 pub struct AuditLogger {
+    path: PathBuf,
     file: Mutex<File>,
     #[cfg(test)]
     fail_next_event: AtomicBool,
@@ -109,6 +110,7 @@ impl AuditLogger {
             ));
         }
         Ok(Self {
+            path,
             file: Mutex::new(file),
             #[cfg(test)]
             fail_next_event: AtomicBool::new(false),
@@ -117,6 +119,22 @@ impl AuditLogger {
             #[cfg(test)]
             fail_after_bytes: AtomicUsize::new(0),
         })
+    }
+
+    pub fn tail_lines(&self, n: usize) -> Result<Vec<String>, String> {
+        use std::io::{BufRead, BufReader, Seek, SeekFrom};
+        let file = File::open(&self.path)
+            .map_err(|e| format!("Cannot open audit log {}: {e}", self.path.display()))?;
+        let mut reader = BufReader::new(file);
+        let len = reader.get_ref().metadata().map(|m| m.len()).unwrap_or(0);
+        if len > 512 * 1024 {
+            let _ = reader.seek(SeekFrom::Start(len - 512 * 1024));
+            let mut discard = String::new();
+            let _ = reader.read_line(&mut discard);
+        }
+        let lines: Vec<String> = reader.lines().filter_map(|l| l.ok()).collect();
+        let start = lines.len().saturating_sub(n);
+        Ok(lines[start..].to_vec())
     }
 
     #[cfg(test)]
@@ -142,6 +160,7 @@ impl AuditLogger {
     pub(crate) fn full_for_test() -> Self {
         let file = OpenOptions::new().write(true).open("/dev/full").unwrap();
         Self {
+            path: PathBuf::from("/dev/full"),
             file: Mutex::new(file),
             fail_next_event: AtomicBool::new(false),
             fail_next_sync: AtomicBool::new(false),
