@@ -61,7 +61,10 @@ struct Cli {
 }
 #[derive(Subcommand)]
 enum Commands {
-    Status,
+    Status {
+        #[arg(long, help = "Output status as JSON")]
+        json: bool,
+    },
     Arm {
         #[arg(
             long,
@@ -92,6 +95,15 @@ enum Commands {
     },
     Exec(ExecArgs),
     Mcp,
+    #[command(about = "View recent audit log entries from the daemon")]
+    Log {
+        #[arg(
+            long,
+            default_value_t = 20,
+            help = "Number of recent audit entries to display"
+        )]
+        limit: usize,
+    },
     #[command(about = "Run the desktop system tray indicator")]
     Tray,
 }
@@ -130,7 +142,7 @@ fn main() -> ExitCode {
 fn run() -> Result<i32, String> {
     let cli = Cli::parse();
     match cli.command {
-        Commands::Status => management(cli.socket.as_deref(), "status", Map::new()),
+        Commands::Status { json } => status_cli(cli.socket.as_deref(), json),
         Commands::Arm {
             duration,
             forever,
@@ -163,6 +175,7 @@ fn run() -> Result<i32, String> {
         ),
         Commands::Exec(args) => exec_cli(cli.socket.as_deref(), args),
         Commands::Mcp => mcp(cli.socket.as_deref()),
+        Commands::Log { limit } => log_cli(cli.socket.as_deref(), limit),
         Commands::Tray => tray::run_tray(&resolve_socket(cli.socket.as_deref())),
     }
 }
@@ -226,6 +239,69 @@ fn rpc(
     }
     serde_json::from_slice(&line).map_err(|e| format!("Malformed response from daemon: {e}"))
 }
+fn status_cli(path: Option<&Path>, json_output: bool) -> Result<i32, String> {
+    if json_output {
+        let socket = resolve_socket(path);
+        let resp = rpc(&socket, "status", Map::new(), Duration::from_secs(10))?;
+        if let Some(err) = resp.get("error") {
+            let msg = err["message"].as_str().unwrap_or("Unknown daemon error");
+            eprintln!("Error: {msg}");
+            return Ok(daemon_error_exit(err["code"].as_i64().unwrap_or(-32603)));
+        }
+        let result = resp.get("result").cloned().unwrap_or_else(|| json!({}));
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&result).unwrap_or_else(|_| "{}".into())
+        );
+        return Ok(0);
+    }
+    management(path, "status", Map::new())
+}
+
+fn log_cli(path: Option<&Path>, limit: usize) -> Result<i32, String> {
+    let socket = resolve_socket(path);
+    let mut params = Map::new();
+    params.insert("limit".into(), json!(limit));
+    let resp = rpc(&socket, "logs", params, Duration::from_secs(10))?;
+    if let Some(err) = resp.get("error") {
+        let msg = err["message"].as_str().unwrap_or("Unknown daemon error");
+        eprintln!("Error: {msg}");
+        return Ok(daemon_error_exit(err["code"].as_i64().unwrap_or(-32603)));
+    }
+    let lines = resp["result"]["lines"]
+        .as_array()
+        .map(|arr| arr.iter().filter_map(|v| v.as_str()).collect::<Vec<_>>())
+        .unwrap_or_default();
+    if lines.is_empty() {
+        println!("No audit records found.");
+        return Ok(0);
+    }
+    for line in lines {
+        if let Ok(val) = serde_json::from_str::<Value>(line) {
+            let ts = val["timestamp"].as_str().unwrap_or("");
+            let event = val["event_type"].as_str().unwrap_or("UNKNOWN");
+            let cmd = val["command"].as_str().unwrap_or("");
+            let exit_code = val["exit_code"].as_i64();
+            let decision = val["decision"].as_str();
+
+            let mut details = String::new();
+            if !cmd.is_empty() {
+                details.push_str(&format!(" cmd={cmd}"));
+            }
+            if let Some(dec) = decision {
+                details.push_str(&format!(" decision={dec}"));
+            }
+            if let Some(code) = exit_code {
+                details.push_str(&format!(" exit={code}"));
+            }
+            println!("[{ts}] {event}{details}");
+        } else {
+            println!("{line}");
+        }
+    }
+    Ok(0)
+}
+
 fn management(
     path: Option<&Path>,
     method: &str,
@@ -356,11 +432,63 @@ fn shell_quote(word: &str) -> String {
     }
 }
 
+fn strip_leading_sudo_argv(args: &[String]) -> &[String] {
+    if args.is_empty() {
+        return args;
+    }
+    if args[0] != "sudo" {
+        return args;
+    }
+    let mut index = 1;
+    while let Some(option) = args.get(index).map(String::as_str) {
+        match option {
+            "--" => {
+                index += 1;
+                break;
+            }
+            "-E" | "-H" | "-n" | "-S" | "-b" | "-P" => index += 1,
+            opt if opt.starts_with('-') => return &args[..0],
+            _ => break,
+        }
+    }
+    &args[index..]
+}
+
+fn strip_leading_sudo(cmd: &str) -> &str {
+    let trimmed = cmd.trim();
+    if trimmed == "sudo" {
+        return "";
+    }
+    let Some(rest) = trimmed.strip_prefix("sudo ") else {
+        return trimmed;
+    };
+    let words: Vec<&str> = rest.split_whitespace().collect();
+    let mut index = 0;
+    while let Some(option) = words.get(index).copied() {
+        match option {
+            "--" => {
+                index += 1;
+                break;
+            }
+            "-E" | "-H" | "-n" | "-S" | "-b" | "-P" => index += 1,
+            opt if opt.starts_with('-') => return "",
+            _ => break,
+        }
+    }
+    let offset = words[..index].iter().map(|w| w.len() + 1).sum::<usize>();
+    rest[offset..].trim_start()
+}
+
 fn exec_cli(path: Option<&Path>, args: ExecArgs) -> Result<i32, String> {
     if !(1..=3600).contains(&args.timeout) {
         return Err("--timeout must be in range 1..3600".into());
     }
-    let command = shell_join(&args.command);
+    let command_args = strip_leading_sudo_argv(&args.command);
+    if command_args.is_empty() {
+        eprintln!("Error: unsupported sudo option or missing command");
+        return Ok(2);
+    }
+    let command = shell_join(command_args);
     let mut env = Map::new();
     for item in args.env {
         if let Some((k, v)) = item.split_once('=') {
@@ -918,6 +1046,18 @@ impl Daemon {
                 rpc_result(id, s)
             }
             "arm" => self.arm_rpc(id, params, p),
+            "extend" => {
+                let seconds = params.get("seconds").and_then(Value::as_u64).unwrap_or(0);
+                match self.state.extend(seconds, p.uid, p.pid) {
+                    Ok(result) => rpc_result(id, result),
+                    Err(error) => rpc_error(
+                        id,
+                        error.code,
+                        error.message,
+                        error.reason.map(|reason| json!({"reason": reason})),
+                    ),
+                }
+            }
             "disarm" => match self.state.disarm(p.uid) {
                 Ok(result) => rpc_result(id, result),
                 Err(error) => rpc_error(
@@ -928,7 +1068,28 @@ impl Daemon {
                 ),
             },
             "exec" => self.exec_rpc(id, params, p),
+            "logs" => self.logs_rpc(id, params, p),
             _ => rpc_error(id, -32601, format!("Method '{method}' not found"), None),
+        }
+    }
+    fn logs_rpc(&self, id: Value, pms: Map<String, Value>, p: &Peer) -> Value {
+        if p.uid != 0 {
+            return rpc_error(
+                id,
+                -32003,
+                "Permission denied: audit logs require root privileges",
+                None,
+            );
+        }
+        let limit = match pms.get("limit") {
+            None => 20,
+            Some(Value::Number(n)) => n.as_u64().unwrap_or(20) as usize,
+            _ => 20,
+        };
+        let limit = limit.clamp(1, 1000);
+        match self.state.audit().tail_lines(limit) {
+            Ok(lines) => rpc_result(id, json!({ "lines": lines })),
+            Err(e) => rpc_error(id, -32603, format!("Failed to read audit logs: {e}"), None),
         }
     }
     fn arm_rpc(&self, id: Value, pms: Map<String, Value>, p: &Peer) -> Value {
@@ -1420,7 +1581,43 @@ fn mcp_handle_line(line: &str, socket: &Path) -> Option<Value> {
     response
 }
 fn tools_schema() -> Value {
-    json!({"tools":[{"name":"run_privileged_command","description":"Execute a shell command with root privileges via the agent-root-runner daemon. Requires the daemon to be armed (sudo agent-root-runner arm).","inputSchema":{"type":"object","properties":{"command":{"type":"string","description":"Shell command to execute (e.g. 'smartctl -a /dev/nvme0n1', 'systemctl restart nginx')"},"timeout":{"type":"integer","description":"Command timeout in seconds (default: 60)","default":60,"minimum":1,"maximum":3600},"workdir":{"type":"string","description":"Working directory (default: /)","default":"/"},"env":{"type":"object","description":"Additional environment variables","additionalProperties":{"type":"string"}}},"required":["command"]}}]})
+    json!({
+        "tools": [
+            {
+                "name": "run_privileged_command",
+                "description": "Execute a shell command with root/superuser privileges via the agent-root-runner daemon. ALWAYS use this tool instead of running 'sudo' in bash or shell execution tools. Trigger this tool whenever a task requires root, administrative privileges, package installation (apt, dnf, pacman), service management (systemctl), filesystem operations (mount, umount), or privileged diagnostics (dmesg, journalctl, smartctl). The daemon must be armed by the operator. Pass the command directly without prefixing 'sudo'.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "command": {
+                            "type": "string",
+                            "description": "Shell command to execute with root privileges (e.g. 'dnf install -y nginx', 'systemctl restart nginx', 'smartctl -a /dev/nvme0n1'). Do not prefix with 'sudo'."
+                        },
+                        "timeout": {
+                            "type": "integer",
+                            "description": "Command timeout in seconds (default: 60)",
+                            "default": 60,
+                            "minimum": 1,
+                            "maximum": 3600
+                        },
+                        "workdir": {
+                            "type": "string",
+                            "description": "Working directory (default: /)",
+                            "default": "/"
+                        },
+                        "env": {
+                            "type": "object",
+                            "description": "Additional environment variables",
+                            "additionalProperties": {
+                                "type": "string"
+                            }
+                        }
+                    },
+                    "required": ["command"]
+                }
+            }
+        ]
+    })
 }
 fn mcp_call(id: Value, params: &Map<String, Value>, socket: &Path) -> Value {
     let name = params.get("name").and_then(Value::as_str).unwrap_or("");
@@ -1436,7 +1633,7 @@ fn mcp_call(id: Value, params: &Map<String, Value>, socket: &Path) -> Value {
             None,
         );
     };
-    let Some(command) = args
+    let Some(raw_command) = args
         .get("command")
         .and_then(Value::as_str)
         .filter(|x| !x.is_empty())
@@ -1448,6 +1645,15 @@ fn mcp_call(id: Value, params: &Map<String, Value>, socket: &Path) -> Value {
             None,
         );
     };
+    let command = strip_leading_sudo(raw_command);
+    if command.is_empty() {
+        return rpc_error(
+            id,
+            -32602,
+            "Missing or invalid required argument: command",
+            None,
+        );
+    }
     let timeout = match args.get("timeout") {
         None => 60,
         Some(value) => match value.as_u64() {
@@ -2188,5 +2394,81 @@ mod socket_parent_tests {
         );
         assert_eq!(disarmed["error"]["code"], -32001);
         assert_eq!(disarmed["error"]["data"]["reason"], "DISARMED");
+    }
+
+    #[test]
+    fn strip_leading_sudo_removes_prefix_correctly() {
+        assert_eq!(
+            strip_leading_sudo("sudo dnf install -y nginx"),
+            "dnf install -y nginx"
+        );
+        assert_eq!(
+            strip_leading_sudo("sudo -E systemctl restart foo"),
+            "systemctl restart foo"
+        );
+        assert_eq!(
+            strip_leading_sudo("sudo -- smartctl -a /dev/sda"),
+            "smartctl -a /dev/sda"
+        );
+        assert_eq!(strip_leading_sudo("  sudo apt update  "), "apt update");
+        assert_eq!(
+            strip_leading_sudo("systemctl restart nginx"),
+            "systemctl restart nginx"
+        );
+        assert_eq!(strip_leading_sudo("sudo"), "");
+        assert_eq!(
+            strip_leading_sudo("sudo -n systemctl restart foo"),
+            "systemctl restart foo"
+        );
+        assert_eq!(strip_leading_sudo("sudo -u root id"), "");
+        assert_eq!(strip_leading_sudo(""), "");
+
+        let argv1 = vec!["sudo".into(), "systemctl".into(), "restart".into()];
+        assert_eq!(strip_leading_sudo_argv(&argv1), &["systemctl", "restart"]);
+
+        let argv2 = vec!["sudo".into(), "-E".into(), "dnf".into(), "upgrade".into()];
+        assert_eq!(strip_leading_sudo_argv(&argv2), &["dnf", "upgrade"]);
+
+        let argv3 = vec!["ls".into(), "-la".into()];
+        assert_eq!(strip_leading_sudo_argv(&argv3), &["ls", "-la"]);
+        let argv4 = vec![
+            "sudo".into(),
+            "-n".into(),
+            "systemctl".into(),
+            "restart".into(),
+        ];
+        assert_eq!(strip_leading_sudo_argv(&argv4), &["systemctl", "restart"]);
+        let argv5 = vec!["sudo".into(), "-u".into(), "root".into(), "id".into()];
+        assert!(strip_leading_sudo_argv(&argv5).is_empty());
+    }
+
+    #[test]
+    fn daemon_handles_logs_rpc_and_tail_lines() {
+        let root = std::env::temp_dir().join(format!(
+            "arr-logs-test-{}-{}",
+            std::process::id(),
+            uuid::Uuid::new_v4()
+        ));
+        fs::create_dir_all(&root).unwrap();
+        let audit = root.join("audit.log");
+        let (daemon, _state) = exec_rpc_test_daemon(&audit);
+        let peer = test_peer();
+
+        let req = json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "logs",
+            "params": { "limit": 5 }
+        })
+        .to_string();
+        let response = daemon.dispatch(&req, &peer);
+        assert!(response["error"].is_null());
+        assert!(response["result"]["lines"].is_array());
+        let mut unprivileged = peer.clone();
+        unprivileged.uid = 1000;
+        let denied = daemon.dispatch(&req, &unprivileged);
+        assert_eq!(denied["error"]["code"], -32003);
+
+        fs::remove_dir_all(&root).unwrap();
     }
 }

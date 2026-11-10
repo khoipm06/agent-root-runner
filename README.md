@@ -87,8 +87,12 @@ for testing against a non-system daemon.
 # Arm for 10 minutes, 20 commands
 sudo agent-root-runner arm --duration 600 --quota 20
 
-# Check state
+# Check state (text or JSON)
 agent-root-runner status
+agent-root-runner status --json
+
+# View recent audit logs (requires root)
+sudo agent-root-runner log --limit 20
 
 # Run something as root
 agent-root-runner exec --workdir "$PWD" -- make install
@@ -137,7 +141,9 @@ pi mcp add agent-root-runner -- agent-root-runner mcp
 ```
 
 It exposes one tool, `run_privileged_command`, which returns the command's exit
-code, stdout and stderr. The daemon must be armed, or the call fails.
+code, stdout and stderr. The daemon must be armed, or the call fails. Agents
+should call this tool instead of attempting to run `sudo` in interactive shell
+environments; any accidental leading `sudo` prefix is automatically stripped.
 
 Agents can also shell out directly:
 
