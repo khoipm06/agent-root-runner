@@ -91,8 +91,12 @@ sudo agent-root-runner arm --duration 600 --quota 20
 agent-root-runner status
 agent-root-runner status --json
 
-# View recent audit logs (requires root)
+# View recent audit logs (plain text or interactive TUI, requires root)
 sudo agent-root-runner log --limit 20
+sudo agent-root-runner log --tui
+
+# Extend active arm session time or quota
+sudo agent-root-runner extend --seconds 600 --quota 10
 
 # Run something as root
 agent-root-runner exec --workdir "$PWD" -- make install
@@ -213,10 +217,10 @@ intend to authorize those payloads.
 
 ```bash
 sudo agent-root-runner uninstall
+sudo agent-root-runner uninstall --purge
 ```
 
-Removes the unit and the tray autostart entry, stops the service, and deletes
-the installed binary.
+Removes the service, autostart desktop entry, and installed binary. Pass `--purge` to also delete audit logs under `/var/log/agent-root-runner`.
 
 ## License
 

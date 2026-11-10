@@ -265,7 +265,7 @@ impl ksni::Tray for RootRunnerTray {
                     label: "Extend ARM (+10 minutes)".into(),
                     icon_name: "document-revert".into(),
                     activate: Box::new(move |_| {
-                        extend_arm(&sock_10, 600);
+                        spawn_extend(&sock_10, &["--seconds", "600"]);
                     }),
                     ..Default::default()
                 }
@@ -278,7 +278,46 @@ impl ksni::Tray for RootRunnerTray {
                     label: "Extend ARM (+15 minutes)".into(),
                     icon_name: "document-revert".into(),
                     activate: Box::new(move |_| {
-                        extend_arm(&sock_15, 900);
+                        spawn_extend(&sock_15, &["--seconds", "900"]);
+                    }),
+                    ..Default::default()
+                }
+                .into(),
+            );
+
+            let sock_q5 = self.socket.clone();
+            items.push(
+                StandardItem {
+                    label: "Extend Quota (+5 commands)".into(),
+                    icon_name: "list-add".into(),
+                    activate: Box::new(move |_| {
+                        spawn_extend(&sock_q5, &["--quota", "5"]);
+                    }),
+                    ..Default::default()
+                }
+                .into(),
+            );
+
+            let sock_q10 = self.socket.clone();
+            items.push(
+                StandardItem {
+                    label: "Extend Quota (+10 commands)".into(),
+                    icon_name: "list-add".into(),
+                    activate: Box::new(move |_| {
+                        spawn_extend(&sock_q10, &["--quota", "10"]);
+                    }),
+                    ..Default::default()
+                }
+                .into(),
+            );
+
+            let sock_ext_custom = self.socket.clone();
+            items.push(
+                StandardItem {
+                    label: "Extend (Custom...)".into(),
+                    icon_name: "configure".into(),
+                    activate: Box::new(move |_| {
+                        prompt_custom_extend(sock_ext_custom.clone());
                     }),
                     ..Default::default()
                 }
@@ -324,6 +363,32 @@ impl ksni::Tray for RootRunnerTray {
                 .into(),
             );
 
+            let sock_q5 = self.socket.clone();
+            items.push(
+                StandardItem {
+                    label: "ARM (5 commands, 5m)".into(),
+                    icon_name: "security-high".into(),
+                    activate: Box::new(move |_| {
+                        spawn_arm(&sock_q5, &["--duration", "300", "--quota", "5"]);
+                    }),
+                    ..Default::default()
+                }
+                .into(),
+            );
+
+            let sock_q10 = self.socket.clone();
+            items.push(
+                StandardItem {
+                    label: "ARM (10 commands, 15m)".into(),
+                    icon_name: "security-high".into(),
+                    activate: Box::new(move |_| {
+                        spawn_arm(&sock_q10, &["--duration", "900", "--quota", "10"]);
+                    }),
+                    ..Default::default()
+                }
+                .into(),
+            );
+
             let sock_forever = self.socket.clone();
             items.push(
                 StandardItem {
@@ -331,6 +396,19 @@ impl ksni::Tray for RootRunnerTray {
                     icon_name: "security-high".into(),
                     activate: Box::new(move |_| {
                         spawn_arm(&sock_forever, &["--forever"]);
+                    }),
+                    ..Default::default()
+                }
+                .into(),
+            );
+
+            let sock_custom = self.socket.clone();
+            items.push(
+                StandardItem {
+                    label: "ARM (Custom...)".into(),
+                    icon_name: "configure".into(),
+                    activate: Box::new(move |_| {
+                        prompt_custom_arm(sock_custom.clone());
                     }),
                     ..Default::default()
                 }
@@ -356,10 +434,173 @@ impl ksni::Tray for RootRunnerTray {
     }
 }
 
-fn extend_arm(socket: &Path, seconds: u64) {
-    let mut params = Map::new();
-    params.insert("seconds".into(), serde_json::json!(seconds));
-    let _ = crate::rpc(socket, "extend", params, Duration::from_secs(5));
+fn spawn_extend(socket: &Path, extra_args: &[&str]) {
+    let exe = std::env::current_exe()
+        .unwrap_or_else(|_| PathBuf::from("/usr/local/bin/agent-root-runner"));
+    let mut args = vec![exe.to_string_lossy().into_owned()];
+    if socket != Path::new("/run/agent-root-runner/runner.sock") {
+        args.push("--socket".to_string());
+        args.push(socket.to_string_lossy().into_owned());
+    }
+    args.push("extend".to_string());
+    for arg in extra_args {
+        args.push(arg.to_string());
+    }
+    let _ = Command::new("pkexec").args(&args).spawn();
+}
+
+fn prompt_custom_arm(socket: PathBuf) {
+    std::thread::spawn(move || {
+        if let Some((duration, quota)) = show_custom_dialog("Agent Root Runner - Custom ARM", true)
+        {
+            let mut args = Vec::new();
+            if let Some(d) = duration {
+                if d == 0 {
+                    args.push("--forever".to_string());
+                } else {
+                    args.push("--duration".to_string());
+                    args.push(d.to_string());
+                }
+            } else {
+                args.push("--forever".to_string());
+            }
+            if let Some(q) = quota {
+                if q > 0 {
+                    args.push("--quota".to_string());
+                    args.push(q.to_string());
+                }
+            }
+            let args_ref: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
+            spawn_arm(&socket, &args_ref);
+        }
+    });
+}
+
+fn prompt_custom_extend(socket: PathBuf) {
+    std::thread::spawn(move || {
+        if let Some((seconds, quota)) = show_custom_dialog("Agent Root Runner - Extend ARM", false)
+        {
+            let mut args = Vec::new();
+            if let Some(s) = seconds {
+                if s > 0 {
+                    args.push("--seconds".to_string());
+                    args.push(s.to_string());
+                }
+            }
+            if let Some(q) = quota {
+                if q > 0 {
+                    args.push("--quota".to_string());
+                    args.push(q.to_string());
+                }
+            }
+            if !args.is_empty() {
+                let args_ref: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
+                spawn_extend(&socket, &args_ref);
+            }
+        }
+    });
+}
+
+fn show_custom_dialog(title: &str, is_arm: bool) -> Option<(Option<u64>, Option<u64>)> {
+    if Path::new("/usr/bin/kdialog").exists() {
+        let dur_prompt = if is_arm {
+            "Duration in minutes (0 or empty for forever):"
+        } else {
+            "Additional minutes to add (leave empty or 0 if none):"
+        };
+        let out1 = Command::new("kdialog")
+            .args([
+                "--title",
+                title,
+                "--inputbox",
+                dur_prompt,
+                if is_arm { "15" } else { "10" },
+            ])
+            .output()
+            .ok()?;
+        if !out1.status.success() {
+            return None;
+        }
+        let dur_str = String::from_utf8_lossy(&out1.stdout).trim().to_string();
+
+        let quota_prompt = if is_arm {
+            "Command quota limit (0 or empty for unlimited):"
+        } else {
+            "Additional command quota to add (leave empty or 0 if none):"
+        };
+        let out2 = Command::new("kdialog")
+            .args([
+                "--title",
+                title,
+                "--inputbox",
+                quota_prompt,
+                if is_arm { "20" } else { "5" },
+            ])
+            .output()
+            .ok()?;
+        if !out2.status.success() {
+            return None;
+        }
+        let quota_str = String::from_utf8_lossy(&out2.stdout).trim().to_string();
+
+        let duration = if dur_str.is_empty() || dur_str == "0" {
+            if is_arm { Some(0) } else { None }
+        } else if let Ok(mins) = dur_str.parse::<u64>() {
+            Some(mins.saturating_mul(60))
+        } else {
+            None
+        };
+
+        let quota = if quota_str.is_empty() || quota_str == "0" {
+            None
+        } else {
+            quota_str.parse::<u64>().ok()
+        };
+
+        Some((duration, quota))
+    } else if Path::new("/usr/bin/zenity").exists() {
+        let out = Command::new("zenity")
+            .args([
+                "--forms",
+                &format!("--title={title}"),
+                "--text=Configure session parameters",
+                "--add-entry=Duration in minutes (0=forever)",
+                "--add-entry=Command quota (empty for unlimited)",
+                "--separator=|",
+            ])
+            .output()
+            .ok()?;
+        if !out.status.success() {
+            return None;
+        }
+        let res = String::from_utf8_lossy(&out.stdout).trim().to_string();
+        let mut parts = res.split('|');
+        let dur_str = parts.next().unwrap_or("").trim();
+        let quota_str = parts.next().unwrap_or("").trim();
+
+        let duration = if dur_str.is_empty() || dur_str == "0" {
+            if is_arm { Some(0) } else { None }
+        } else if let Ok(mins) = dur_str.parse::<u64>() {
+            Some(mins.saturating_mul(60))
+        } else {
+            None
+        };
+
+        let quota = if quota_str.is_empty() || quota_str == "0" {
+            None
+        } else {
+            quota_str.parse::<u64>().ok()
+        };
+
+        Some((duration, quota))
+    } else {
+        send_desktop_notification(
+            title,
+            "Please use 'sudo agent-root-runner arm --duration <sec> --quota <n>' in terminal.",
+            "normal",
+        );
+        None
+    }
 }
 
 fn spawn_arm(socket: &Path, extra_args: &[&str]) {
