@@ -197,9 +197,8 @@ fn run() -> Result<i32, String> {
             quota,
         } => {
             let mut p = Map::new();
-            let is_forever = forever || (quota.is_some() && duration.is_none());
-            p.insert("forever".into(), json!(is_forever));
-            if !is_forever {
+            p.insert("forever".into(), json!(forever));
+            if !forever {
                 p.insert("duration_seconds".into(), json!(duration.unwrap_or(900)));
             }
             if let Some(q) = quota {
@@ -1959,15 +1958,19 @@ fn install(completions: bool) -> Result<i32, String> {
 
     if let Some(home) = invoking_user_home() {
         let user_bin = home.join(".local/bin/agent-root-runner");
-        if user_bin.exists() {
-            if let Err(e) = fs::copy(dest, &user_bin) {
-                eprintln!(
+        let is_regular = fs::symlink_metadata(&user_bin)
+            .map(|m| m.file_type().is_file())
+            .unwrap_or(false);
+        if is_regular {
+            let result = fs::read(dest)
+                .map_err(|e| e.to_string())
+                .and_then(|bytes| write_secure(&user_bin, &bytes, 0o755));
+            match result {
+                Ok(()) => println!("Updated shadowing user binary: {}", user_bin.display()),
+                Err(e) => eprintln!(
                     "Warning: could not update shadowing {}: {e}",
                     user_bin.display()
-                );
-            } else {
-                let _ = fs::set_permissions(&user_bin, fs::Permissions::from_mode(0o755));
-                println!("Updated shadowing user binary: {}", user_bin.display());
+                ),
             }
         }
     }

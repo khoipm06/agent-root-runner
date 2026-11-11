@@ -369,7 +369,7 @@ impl ksni::Tray for RootRunnerTray {
                     label: "ARM (5 commands)".into(),
                     icon_name: "security-high".into(),
                     activate: Box::new(move |_| {
-                        spawn_arm(&sock_q5, &["--quota", "5"]);
+                        spawn_arm(&sock_q5, &["--forever", "--quota", "5"]);
                     }),
                     ..Default::default()
                 }
@@ -382,7 +382,7 @@ impl ksni::Tray for RootRunnerTray {
                     label: "ARM (10 commands)".into(),
                     icon_name: "security-high".into(),
                     activate: Box::new(move |_| {
-                        spawn_arm(&sock_q10, &["--quota", "10"]);
+                        spawn_arm(&sock_q10, &["--forever", "--quota", "10"]);
                     }),
                     ..Default::default()
                 }
@@ -462,6 +462,7 @@ fn prompt_custom_arm(socket: PathBuf) {
                     args.push(d.to_string());
                 }
             } else if let Some(q) = quota {
+                args.push("--forever".to_string());
                 args.push("--quota".to_string());
                 args.push(q.to_string());
             } else {
