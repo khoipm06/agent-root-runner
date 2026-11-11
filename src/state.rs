@@ -110,17 +110,37 @@ impl StateMachine {
     pub fn audit(&self) -> &AuditLogger {
         &self.audit
     }
-    /// Adds time to the active finite session without resetting its quota.
-    pub fn extend(&self, extra_seconds: u64, uid: u32, pid: i32) -> Result<Value, RpcError> {
+    /// Adds time and/or quota to the active session.
+    pub fn extend(
+        &self,
+        extra_seconds: Option<u64>,
+        extra_quota: Option<u64>,
+        uid: u32,
+        pid: i32,
+    ) -> Result<Value, RpcError> {
         if uid != 0 {
             return Err(RpcError::permission(format!(
                 "Permission denied: extending ARM requires root privileges (peer_uid == 0, got {uid})."
             )));
         }
-        if extra_seconds == 0 || extra_seconds > MAX_DURATION_SECONDS {
+        if extra_seconds.is_none() && extra_quota.is_none() {
             return Err(RpcError::invalid(
-                "extension must be within 1..=86400 seconds",
+                "extension must specify positive seconds and/or quota",
             ));
+        }
+        if let Some(sec) = extra_seconds {
+            if sec == 0 || sec > MAX_DURATION_SECONDS {
+                return Err(RpcError::invalid(
+                    "extension seconds must be within 1..=86400",
+                ));
+            }
+        }
+        if let Some(q) = extra_quota {
+            if q == 0 || q > 1_000_000 {
+                return Err(RpcError::invalid(
+                    "extension quota must be within 1..=1000000",
+                ));
+            }
         }
         let mut g = self
             .inner
@@ -139,20 +159,42 @@ impl StateMachine {
         if !g.armed {
             return Err(RpcError::invalid("No active ARM session to extend"));
         }
-        let (duration, added, sid, left) = {
+        let (duration, added_sec, sid, new_left, added_q) = {
             let Some(session) = g.session.as_mut() else {
                 return Err(RpcError::invalid("No active ARM session to extend"));
             };
-            let Some(duration) = session.duration else {
-                return Err(RpcError::invalid("Cannot extend an unlimited ARM session"));
+            let (new_duration, added_sec) = if let Some(sec) = extra_seconds {
+                let Some(duration) = session.duration else {
+                    return Err(RpcError::invalid(
+                        "Cannot extend time on an unlimited ARM session",
+                    ));
+                };
+                let new_duration = duration.saturating_add(sec).min(MAX_DURATION_SECONDS);
+                let added = new_duration.saturating_sub(duration);
+                session.duration = Some(new_duration);
+                session.mono += Duration::from_secs(added);
+                (Some(new_duration), added)
+            } else {
+                (session.duration, 0)
             };
-            let new_duration = duration
-                .saturating_add(extra_seconds)
-                .min(MAX_DURATION_SECONDS);
-            let added = new_duration.saturating_sub(duration);
-            session.duration = Some(new_duration);
-            session.mono += Duration::from_secs(added);
-            (new_duration, added, session.id.clone(), session.left)
+
+            let (new_left, added_q) = if let Some(q) = extra_quota {
+                let curr_left = session.left.unwrap_or(0);
+                let updated = curr_left.saturating_add(q);
+                session.left = Some(updated);
+                session.quota = Some(session.quota.unwrap_or(0).saturating_add(q));
+                (Some(updated), q)
+            } else {
+                (session.left, 0)
+            };
+
+            (
+                new_duration,
+                added_sec,
+                session.id.clone(),
+                new_left,
+                added_q,
+            )
         };
         let result = status_inner(&g);
         if let Err(error) = self.emit_locked(
@@ -164,9 +206,16 @@ impl StateMachine {
             None,
             object(&[
                 ("session_id", json!(sid)),
-                ("extension_seconds", json!(added)),
-                ("duration_seconds", json!(duration)),
-                ("quota_remaining", json!(left)),
+                ("extension_seconds", json!(added_sec)),
+                ("extension_quota", json!(added_q)),
+                (
+                    "duration_seconds",
+                    duration.map(|d| json!(d)).unwrap_or(Value::Null),
+                ),
+                (
+                    "quota_remaining",
+                    new_left.map(|l| json!(l)).unwrap_or(Value::Null),
+                ),
             ]),
         ) {
             g.armed = false;
@@ -915,12 +964,22 @@ mod tests {
     fn extend_adds_to_deadline_without_resetting_quota_or_start_time() {
         let (m, p) = machine();
         let before = m.arm(Some(30), Some(4), false, 0, 1).unwrap();
-        let result = m.extend(10, 0, 2).unwrap();
+        let result = m.extend(Some(10), None, 0, 2).unwrap();
         assert_eq!(result["duration_seconds"], 40);
         assert_eq!(result["quota_remaining"], 4);
         assert_eq!(result["session_id"], before["session_id"]);
         assert_eq!(result["armed_at"], before["armed_at"]);
-        assert_eq!(m.extend(10, 1000, 2).unwrap_err().code, -32003);
+
+        let q_res = m.extend(None, Some(5), 0, 2).unwrap();
+        assert_eq!(q_res["duration_seconds"], 40);
+        assert_eq!(q_res["quota_remaining"], 9);
+
+        let both = m.extend(Some(20), Some(3), 0, 2).unwrap();
+        assert_eq!(both["duration_seconds"], 60);
+        assert_eq!(both["quota_remaining"], 12);
+
+        assert_eq!(m.extend(Some(10), None, 1000, 2).unwrap_err().code, -32003);
+        assert_eq!(m.extend(None, None, 0, 2).unwrap_err().code, -32602);
         let _ = fs::remove_file(p);
     }
 
@@ -955,7 +1014,7 @@ mod tests {
         assert!(s["is_armed"].as_bool().unwrap());
         assert_eq!(s["quota_remaining"], 1);
         let a = m.admit(1, 0, 0, "test", "echo y").unwrap();
-        assert_eq!(a.remaining_seconds.unwrap_or_default() > 0., true);
+        assert!(a.remaining_seconds.unwrap_or_default() > 0.);
         m.disarm(0).unwrap();
         m.refund_quota().unwrap();
         assert_eq!(m.status().unwrap()["is_armed"], false);

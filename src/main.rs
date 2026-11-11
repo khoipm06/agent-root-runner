@@ -3,9 +3,14 @@ mod executor;
 mod guardrails;
 mod state;
 mod tray;
+mod tui;
 
 use audit::{AuditLogger, object};
-use clap::{Args, Parser, Subcommand};
+use clap::{Args, CommandFactory, Parser, Subcommand, ValueEnum};
+use clap_complete::{
+    generate,
+    shells::{Bash, Fish, Zsh},
+};
 use executor::Executor;
 use serde_json::{Map, Value, json};
 use signal_hook::{
@@ -14,7 +19,7 @@ use signal_hook::{
 };
 use state::StateMachine;
 use std::fs::{self, OpenOptions};
-use std::io::{self, BufRead, BufReader, Read, Write};
+use std::io::{self, BufRead, BufReader, IsTerminal, Read, Write};
 use std::os::fd::AsRawFd;
 use std::os::unix::fs::{FileTypeExt, MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::os::unix::net::{UnixListener, UnixStream};
@@ -59,12 +64,21 @@ struct Cli {
     #[command(subcommand)]
     command: Commands,
 }
+#[derive(Clone, Copy, ValueEnum)]
+enum ShellType {
+    Bash,
+    Zsh,
+    Fish,
+}
+
 #[derive(Subcommand)]
 enum Commands {
+    #[command(about = "Display daemon status, armed state, and remaining quota/timeout")]
     Status {
         #[arg(long, help = "Output status as JSON")]
         json: bool,
     },
+    #[command(about = "Arm the daemon for privileged command execution (requires root)")]
     Arm {
         #[arg(
             long,
@@ -81,9 +95,29 @@ enum Commands {
         #[arg(long, help = "Maximum admitted commands before automatic disarm")]
         quota: Option<u64>,
     },
+    #[command(about = "Extend an active arm session's duration or command quota (requires root)")]
+    Extend {
+        #[arg(long, help = "Additional seconds to extend the active arm session")]
+        seconds: Option<u64>,
+        #[arg(long, help = "Additional command quota to extend")]
+        quota: Option<u64>,
+    },
+    #[command(about = "Disarm the daemon immediately and terminate in-flight commands")]
     Disarm,
-    Install,
-    Uninstall,
+    #[command(about = "Install daemon systemd unit, binary, autostart tray, and shell completions")]
+    Install {
+        #[arg(
+            long,
+            help = "Also install shell completions for bash, zsh, and fish to system directories"
+        )]
+        completions: bool,
+    },
+    #[command(about = "Uninstall daemon systemd unit, autostart tray, binary, and optional logs")]
+    Uninstall {
+        #[arg(long, help = "Purge all audit logs under /var/log/agent-root-runner")]
+        purge: bool,
+    },
+    #[command(about = "Run the privileged daemon process")]
     Daemon {
         #[arg(long, help = "Append-only audit log path")]
         audit_log: Option<PathBuf>,
@@ -93,19 +127,33 @@ enum Commands {
         )]
         allow_user_arm: bool,
     },
+    #[command(about = "Execute a command as root while the daemon is armed")]
     Exec(ExecArgs),
+    #[command(about = "Start Model Context Protocol (MCP) server over stdio for AI agents")]
     Mcp,
-    #[command(about = "View recent audit log entries from the daemon")]
+    #[command(
+        about = "View recent audit log entries from the daemon (interactive TUI by default, or raw text)"
+    )]
     Log {
         #[arg(
             long,
-            default_value_t = 20,
-            help = "Number of recent audit entries to display"
+            default_value_t = 50,
+            help = "Number of recent audit entries to fetch/display"
         )]
         limit: usize,
+        #[arg(
+            long,
+            help = "Output raw plain text logs instead of launching interactive TUI"
+        )]
+        raw: bool,
     },
     #[command(about = "Run the desktop system tray indicator")]
     Tray,
+    #[command(about = "Generate shell completion script for bash, zsh, or fish")]
+    Completion {
+        #[arg(value_enum, help = "Shell to generate completions for")]
+        shell: ShellType,
+    },
 }
 #[derive(Args)]
 struct ExecArgs {
@@ -163,8 +211,13 @@ fn run() -> Result<i32, String> {
             Ok(res)
         }
         Commands::Disarm => management(cli.socket.as_deref(), "disarm", Map::new()),
-        Commands::Install => install(),
-        Commands::Uninstall => uninstall(),
+        Commands::Extend { seconds, quota } => extend_cli(cli.socket.as_deref(), seconds, quota),
+        Commands::Install { completions } => install(completions),
+        Commands::Uninstall { purge } => uninstall(purge),
+        Commands::Completion { shell } => {
+            print_completions(shell);
+            Ok(0)
+        }
         Commands::Daemon {
             audit_log,
             allow_user_arm,
@@ -175,7 +228,7 @@ fn run() -> Result<i32, String> {
         ),
         Commands::Exec(args) => exec_cli(cli.socket.as_deref(), args),
         Commands::Mcp => mcp(cli.socket.as_deref()),
-        Commands::Log { limit } => log_cli(cli.socket.as_deref(), limit),
+        Commands::Log { limit, raw } => log_cli(cli.socket.as_deref(), limit, raw),
         Commands::Tray => tray::run_tray(&resolve_socket(cli.socket.as_deref())),
     }
 }
@@ -258,8 +311,11 @@ fn status_cli(path: Option<&Path>, json_output: bool) -> Result<i32, String> {
     management(path, "status", Map::new())
 }
 
-fn log_cli(path: Option<&Path>, limit: usize) -> Result<i32, String> {
+fn log_cli(path: Option<&Path>, limit: usize, raw: bool) -> Result<i32, String> {
     let socket = resolve_socket(path);
+    if !raw && std::io::stdout().is_terminal() {
+        return tui::run_log_viewer(&socket, limit.max(100));
+    }
     let mut params = Map::new();
     params.insert("limit".into(), json!(limit));
     let resp = rpc(&socket, "logs", params, Duration::from_secs(10))?;
@@ -298,6 +354,46 @@ fn log_cli(path: Option<&Path>, limit: usize) -> Result<i32, String> {
         } else {
             println!("{line}");
         }
+    }
+    Ok(0)
+}
+
+fn extend_cli(
+    path: Option<&Path>,
+    seconds: Option<u64>,
+    quota: Option<u64>,
+) -> Result<i32, String> {
+    let socket = resolve_socket(path);
+    let mut params = Map::new();
+    if let Some(s) = seconds {
+        params.insert("seconds".into(), json!(s));
+    }
+    if let Some(q) = quota {
+        params.insert("quota".into(), json!(q));
+    }
+    let resp = rpc(&socket, "extend", params, Duration::from_secs(10))?;
+    if let Some(err) = resp.get("error") {
+        let msg = err["message"].as_str().unwrap_or("Unknown daemon error");
+        eprintln!(
+            "Error: {msg}{}",
+            if err["code"] == -32003 {
+                " (run with sudo)"
+            } else {
+                ""
+            }
+        );
+        return Ok(daemon_error_exit(err["code"].as_i64().unwrap_or(-32603)));
+    }
+    let result = &resp["result"];
+    println!("Session extended successfully.");
+    if let Some(d) = result["duration_seconds"].as_u64() {
+        println!("  Duration: {d}s");
+    }
+    if let Some(rem) = result["remaining_seconds"].as_f64() {
+        println!("  Remaining: {rem:.1}s");
+    }
+    if let Some(q) = result["quota_remaining"].as_u64() {
+        println!("  Quota remaining: {q}");
     }
     Ok(0)
 }
@@ -1047,8 +1143,9 @@ impl Daemon {
             }
             "arm" => self.arm_rpc(id, params, p),
             "extend" => {
-                let seconds = params.get("seconds").and_then(Value::as_u64).unwrap_or(0);
-                match self.state.extend(seconds, p.uid, p.pid) {
+                let seconds = params.get("seconds").and_then(Value::as_u64);
+                let quota = params.get("quota").and_then(Value::as_u64);
+                match self.state.extend(seconds, quota, p.uid, p.pid) {
                     Ok(result) => rpc_result(id, result),
                     Err(error) => rpc_error(
                         id,
@@ -1742,6 +1839,10 @@ const UNIT_PATH: &str = "/etc/systemd/system/agent-root-runner.service";
 const BIN_PATH: &str = "/usr/local/bin/agent-root-runner";
 const MANIFEST_PATH: &str = "/etc/agent-root-runner/installed-files";
 const AUTOSTART_PATH: &str = "/etc/xdg/autostart/agent-root-runner-tray.desktop";
+const AUDIT_LOG_DIR: &str = "/var/log/agent-root-runner";
+const BASH_COMPLETION_PATH: &str = "/usr/share/bash-completion/completions/agent-root-runner";
+const ZSH_COMPLETION_PATH: &str = "/usr/share/zsh/site-functions/_agent-root-runner";
+const FISH_COMPLETION_PATH: &str = "/usr/share/fish/vendor_completions.d/agent-root-runner.fish";
 
 const AUTOSTART_DESKTOP: &str = r#"[Desktop Entry]
 Type=Application
@@ -1753,15 +1854,53 @@ Terminal=false
 Categories=Utility;
 "#;
 
-fn install() -> Result<i32, String> {
+fn print_completions(shell: ShellType) {
+    let mut cmd = Cli::command();
+    let name = "agent-root-runner";
+    match shell {
+        ShellType::Bash => generate(Bash, &mut cmd, name, &mut io::stdout()),
+        ShellType::Zsh => generate(Zsh, &mut cmd, name, &mut io::stdout()),
+        ShellType::Fish => generate(Fish, &mut cmd, name, &mut io::stdout()),
+    }
+}
+
+fn install_shell_completions() -> Result<(), String> {
+    let name = "agent-root-runner";
+    let targets = [
+        (BASH_COMPLETION_PATH, {
+            let mut buf = Vec::new();
+            generate(Bash, &mut Cli::command(), name, &mut buf);
+            buf
+        }),
+        (ZSH_COMPLETION_PATH, {
+            let mut buf = Vec::new();
+            generate(Zsh, &mut Cli::command(), name, &mut buf);
+            buf
+        }),
+        (FISH_COMPLETION_PATH, {
+            let mut buf = Vec::new();
+            generate(Fish, &mut Cli::command(), name, &mut buf);
+            buf
+        }),
+    ];
+
+    for (path_str, content) in targets {
+        let p = Path::new(path_str);
+        if let Some(parent) = p.parent() {
+            fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+        }
+        write_secure(p, &content, 0o644)?;
+        println!("Installed shell completion: {path_str}");
+    }
+    Ok(())
+}
+
+fn install(completions: bool) -> Result<i32, String> {
     if unsafe { libc::geteuid() } != 0 {
         return Err("install requires root. Run with sudo.".into());
     }
     let source = std::env::current_exe().map_err(|e| e.to_string())?;
     let dest = Path::new(BIN_PATH);
-    // Write the unit and the manifest before copying the binary: a partial
-    // failure can never leave an untracked binary behind, and `uninstall`
-    // can always recover from the manifest.
     let unit = Path::new(UNIT_PATH);
     if let Some(parent) = unit.parent() {
         fs::create_dir_all(parent).map_err(|e| e.to_string())?
@@ -1806,15 +1945,6 @@ fn install() -> Result<i32, String> {
         }
     }
 
-    let mpath = Path::new(MANIFEST_PATH);
-    if let Some(parent) = mpath.parent() {
-        fs::create_dir_all(parent).map_err(|e| e.to_string())?;
-    }
-    write_secure(
-        mpath,
-        format!("{BIN_PATH}\n{UNIT_PATH}\n{AUTOSTART_PATH}\n").as_bytes(),
-        0o600,
-    )?;
     if source != dest {
         let tmp = Path::new("/usr/local/bin/.agent-root-runner.new");
         let _ = fs::remove_file(tmp);
@@ -1825,6 +1955,30 @@ fn install() -> Result<i32, String> {
     } else {
         println!("Reinstalled in place: {BIN_PATH}");
     }
+
+    if let Some(home) = invoking_user_home() {
+        let user_bin = home.join(".local/bin/agent-root-runner");
+        let is_regular = fs::symlink_metadata(&user_bin)
+            .map(|m| m.file_type().is_file())
+            .unwrap_or(false);
+        if is_regular {
+            let result = fs::read(dest)
+                .map_err(|e| e.to_string())
+                .and_then(|bytes| write_secure(&user_bin, &bytes, 0o755));
+            match result {
+                Ok(()) => println!("Updated shadowing user binary: {}", user_bin.display()),
+                Err(e) => eprintln!(
+                    "Warning: could not update shadowing {}: {e}",
+                    user_bin.display()
+                ),
+            }
+        }
+    }
+
+    if completions {
+        install_shell_completions()?;
+    }
+
     let _ = systemctl(&["daemon-reload"]);
     let _ = systemctl(&["enable", "agent-root-runner.service"]);
     if systemctl(&["restart", "agent-root-runner.service"]) != 0 {
@@ -1876,63 +2030,49 @@ fn unit_with_admin_group(group: Option<&str>) -> String {
         None => UNIT_TEXT.to_string(),
     }
 }
-fn uninstall() -> Result<i32, String> {
+fn uninstall(purge: bool) -> Result<i32, String> {
     if unsafe { libc::geteuid() } != 0 {
         return Err("uninstall requires root. Run with sudo.".into());
     }
     let _ = systemctl(&["stop", "agent-root-runner.service"]);
     let _ = systemctl(&["disable", "agent-root-runner.service"]);
-    let manifest = fs::read_to_string(MANIFEST_PATH).unwrap_or_default();
-    // A missing/empty manifest means a partial install: treat everything as
-    // tracked so uninstall recovers it instead of leaving it behind forever.
-    let untracked = manifest.trim().is_empty();
-    let mut incomplete = false;
-    if untracked || manifest.lines().any(|x| x == UNIT_PATH) {
-        match fs::remove_file(UNIT_PATH) {
-            Ok(()) => println!("Removed: {UNIT_PATH}"),
+
+    for path in [
+        UNIT_PATH,
+        BIN_PATH,
+        AUTOSTART_PATH,
+        BASH_COMPLETION_PATH,
+        ZSH_COMPLETION_PATH,
+        FISH_COMPLETION_PATH,
+    ] {
+        match fs::remove_file(path) {
+            Ok(()) => println!("Removed: {path}"),
             Err(e) if e.kind() == io::ErrorKind::NotFound => (),
-            Err(e) => {
-                incomplete = true;
-                eprintln!("Warning: could not remove {UNIT_PATH}: {e}");
-            }
+            Err(e) => eprintln!("Warning: could not remove {path}: {e}"),
         }
     }
     let _ = systemctl(&["daemon-reload"]);
     let _ = systemctl(&["reset-failed", "agent-root-runner.service"]);
-    if untracked || manifest.lines().any(|x| x == BIN_PATH) {
-        // Remove the binary even when uninstall runs from the installed
-        // path itself: unlinking a running ELF is allowed on Linux (the
-        // process keeps its mapping), and skipping it silently made the
-        // binary unremovable in practice.
-        match fs::remove_file(BIN_PATH) {
-            Ok(()) => println!("Removed: {BIN_PATH}"),
-            Err(e) if e.kind() == io::ErrorKind::NotFound => (),
-            Err(e) => {
-                incomplete = true;
-                eprintln!("Warning: could not remove {BIN_PATH}: {e}");
-            }
-        }
-    }
-    if untracked || manifest.lines().any(|x| x == AUTOSTART_PATH) {
-        match fs::remove_file(AUTOSTART_PATH) {
-            Ok(()) => println!("Removed: {AUTOSTART_PATH}"),
-            Err(e) if e.kind() == io::ErrorKind::NotFound => (),
-            Err(e) => {
-                incomplete = true;
-                eprintln!("Warning: could not remove {AUTOSTART_PATH}: {e}");
-            }
-        }
-    }
-    if incomplete {
-        // Keep the manifest so a retry can finish cleanup; deleting it now
-        // would make the leftovers permanently unremovable.
-        eprintln!("Note: {MANIFEST_PATH} kept so uninstall can be retried.");
-    } else {
-        let _ = fs::remove_file(MANIFEST_PATH);
-        let _ = fs::remove_dir("/etc/agent-root-runner");
-    }
+
+    let _ = fs::remove_file(MANIFEST_PATH);
+    let _ = fs::remove_dir("/etc/agent-root-runner");
     let _ = fs::remove_dir("/run/agent-root-runner");
-    println!("Note: audit logs under /var/log/agent-root-runner are preserved.");
+
+    if purge {
+        let log_dir = Path::new(AUDIT_LOG_DIR);
+        if log_dir.exists() {
+            if let Err(e) = fs::remove_dir_all(log_dir) {
+                eprintln!(
+                    "Warning: could not purge audit logs at {}: {e}",
+                    log_dir.display()
+                );
+            } else {
+                println!("Purged audit logs under {}", log_dir.display());
+            }
+        }
+    } else {
+        println!("Note: audit logs under /var/log/agent-root-runner are preserved.");
+    }
     Ok(0)
 }
 fn write_secure(path: &Path, bytes: &[u8], mode: u32) -> Result<(), String> {
@@ -2464,6 +2604,42 @@ mod socket_parent_tests {
         let response = daemon.dispatch(&req, &peer);
         assert!(response["error"].is_null());
         assert!(response["result"]["lines"].is_array());
+        let mut unprivileged = peer.clone();
+        unprivileged.uid = 1000;
+        let denied = daemon.dispatch(&req, &unprivileged);
+        assert_eq!(denied["error"]["code"], -32003);
+
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn daemon_handles_extend_rpc_with_quota_and_time() {
+        let root = std::env::temp_dir().join(format!(
+            "arr-extend-test-{}-{}",
+            std::process::id(),
+            uuid::Uuid::new_v4()
+        ));
+        fs::create_dir_all(&root).unwrap();
+        let audit = root.join("audit.log");
+        let (daemon, state) = exec_rpc_test_daemon(&audit);
+        let peer = test_peer();
+
+        // Arm session
+        state.arm(Some(30), Some(3), false, 0, 1).unwrap();
+
+        let req = json!({
+            "jsonrpc": "2.0",
+            "id": 2,
+            "method": "extend",
+            "params": { "seconds": 20, "quota": 5 }
+        })
+        .to_string();
+        let response = daemon.dispatch(&req, &peer);
+        assert!(response["error"].is_null());
+        assert_eq!(response["result"]["duration_seconds"], 50);
+        assert_eq!(response["result"]["quota_remaining"], 8);
+
+        // Non-root denied
         let mut unprivileged = peer.clone();
         unprivileged.uid = 1000;
         let denied = daemon.dispatch(&req, &unprivileged);
