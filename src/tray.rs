@@ -259,13 +259,13 @@ impl ksni::Tray for RootRunnerTray {
         items.push(MenuItem::Separator);
 
         if self.armed {
-            let sock_10 = self.socket.clone();
+            let sock_5 = self.socket.clone();
             items.push(
                 StandardItem {
-                    label: "Extend ARM (+10 minutes)".into(),
+                    label: "Extend (+5 minutes)".into(),
                     icon_name: "document-revert".into(),
                     activate: Box::new(move |_| {
-                        spawn_extend(&sock_10, &["--seconds", "600"]);
+                        spawn_extend(&sock_5, &["--seconds", "300"]);
                     }),
                     ..Default::default()
                 }
@@ -275,7 +275,7 @@ impl ksni::Tray for RootRunnerTray {
             let sock_15 = self.socket.clone();
             items.push(
                 StandardItem {
-                    label: "Extend ARM (+15 minutes)".into(),
+                    label: "Extend (+15 minutes)".into(),
                     icon_name: "document-revert".into(),
                     activate: Box::new(move |_| {
                         spawn_extend(&sock_15, &["--seconds", "900"]);
@@ -288,7 +288,7 @@ impl ksni::Tray for RootRunnerTray {
             let sock_q5 = self.socket.clone();
             items.push(
                 StandardItem {
-                    label: "Extend Quota (+5 commands)".into(),
+                    label: "Extend (+5 commands)".into(),
                     icon_name: "list-add".into(),
                     activate: Box::new(move |_| {
                         spawn_extend(&sock_q5, &["--quota", "5"]);
@@ -301,7 +301,7 @@ impl ksni::Tray for RootRunnerTray {
             let sock_q10 = self.socket.clone();
             items.push(
                 StandardItem {
-                    label: "Extend Quota (+10 commands)".into(),
+                    label: "Extend (+10 commands)".into(),
                     icon_name: "list-add".into(),
                     activate: Box::new(move |_| {
                         spawn_extend(&sock_q10, &["--quota", "10"]);
@@ -366,10 +366,10 @@ impl ksni::Tray for RootRunnerTray {
             let sock_q5 = self.socket.clone();
             items.push(
                 StandardItem {
-                    label: "ARM (5 commands, 5m)".into(),
+                    label: "ARM (5 commands)".into(),
                     icon_name: "security-high".into(),
                     activate: Box::new(move |_| {
-                        spawn_arm(&sock_q5, &["--duration", "300", "--quota", "5"]);
+                        spawn_arm(&sock_q5, &["--quota", "5"]);
                     }),
                     ..Default::default()
                 }
@@ -379,10 +379,10 @@ impl ksni::Tray for RootRunnerTray {
             let sock_q10 = self.socket.clone();
             items.push(
                 StandardItem {
-                    label: "ARM (10 commands, 15m)".into(),
+                    label: "ARM (10 commands)".into(),
                     icon_name: "security-high".into(),
                     activate: Box::new(move |_| {
-                        spawn_arm(&sock_q10, &["--duration", "900", "--quota", "10"]);
+                        spawn_arm(&sock_q10, &["--quota", "10"]);
                     }),
                     ..Default::default()
                 }
@@ -461,14 +461,11 @@ fn prompt_custom_arm(socket: PathBuf) {
                     args.push("--duration".to_string());
                     args.push(d.to_string());
                 }
+            } else if let Some(q) = quota {
+                args.push("--quota".to_string());
+                args.push(q.to_string());
             } else {
                 args.push("--forever".to_string());
-            }
-            if let Some(q) = quota {
-                if q > 0 {
-                    args.push("--quota".to_string());
-                    args.push(q.to_string());
-                }
             }
             let args_ref: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
             spawn_arm(&socket, &args_ref);
@@ -486,8 +483,7 @@ fn prompt_custom_extend(socket: PathBuf) {
                     args.push("--seconds".to_string());
                     args.push(s.to_string());
                 }
-            }
-            if let Some(q) = quota {
+            } else if let Some(q) = quota {
                 if q > 0 {
                     args.push("--quota".to_string());
                     args.push(q.to_string());
@@ -503,100 +499,156 @@ fn prompt_custom_extend(socket: PathBuf) {
 
 fn show_custom_dialog(title: &str, is_arm: bool) -> Option<(Option<u64>, Option<u64>)> {
     if Path::new("/usr/bin/kdialog").exists() {
-        let dur_prompt = if is_arm {
-            "Duration in minutes (0 or empty for forever):"
-        } else {
-            "Additional minutes to add (leave empty or 0 if none):"
-        };
-        let out1 = Command::new("kdialog")
+        let type_out = Command::new("kdialog")
             .args([
                 "--title",
                 title,
-                "--inputbox",
-                dur_prompt,
-                if is_arm { "15" } else { "10" },
+                "--radiolist",
+                "Select limit type:",
+                "time",
+                "Duration (Minutes)",
+                "on",
+                "quota",
+                "Command Quota (Count)",
+                "off",
             ])
             .output()
             .ok()?;
-        if !out1.status.success() {
+        if !type_out.status.success() {
             return None;
         }
-        let dur_str = String::from_utf8_lossy(&out1.stdout).trim().to_string();
+        let choice = String::from_utf8_lossy(&type_out.stdout).trim().to_string();
 
-        let quota_prompt = if is_arm {
-            "Command quota limit (0 or empty for unlimited):"
+        if choice == "quota" {
+            let prompt = if is_arm {
+                "Command quota limit (number of commands):"
+            } else {
+                "Additional command quota to add:"
+            };
+            let out = Command::new("kdialog")
+                .args([
+                    "--title",
+                    title,
+                    "--inputbox",
+                    prompt,
+                    if is_arm { "10" } else { "5" },
+                ])
+                .output()
+                .ok()?;
+            if !out.status.success() {
+                return None;
+            }
+            let quota_str = String::from_utf8_lossy(&out.stdout).trim().to_string();
+            let quota = quota_str.parse::<u64>().ok().filter(|&q| q > 0);
+            Some((None, quota))
         } else {
-            "Additional command quota to add (leave empty or 0 if none):"
-        };
-        let out2 = Command::new("kdialog")
-            .args([
-                "--title",
-                title,
-                "--inputbox",
-                quota_prompt,
-                if is_arm { "20" } else { "5" },
-            ])
-            .output()
-            .ok()?;
-        if !out2.status.success() {
-            return None;
+            let prompt = if is_arm {
+                "Duration in minutes (0 or empty for forever):"
+            } else {
+                "Additional minutes to add:"
+            };
+            let out = Command::new("kdialog")
+                .args([
+                    "--title",
+                    title,
+                    "--inputbox",
+                    prompt,
+                    if is_arm { "15" } else { "10" },
+                ])
+                .output()
+                .ok()?;
+            if !out.status.success() {
+                return None;
+            }
+            let dur_str = String::from_utf8_lossy(&out.stdout).trim().to_string();
+            let duration = if dur_str.is_empty() || dur_str == "0" {
+                if is_arm { Some(0) } else { None }
+            } else if let Ok(mins) = dur_str.parse::<u64>() {
+                Some(mins.saturating_mul(60))
+            } else {
+                None
+            };
+            Some((duration, None))
         }
-        let quota_str = String::from_utf8_lossy(&out2.stdout).trim().to_string();
-
-        let duration = if dur_str.is_empty() || dur_str == "0" {
-            if is_arm { Some(0) } else { None }
-        } else if let Ok(mins) = dur_str.parse::<u64>() {
-            Some(mins.saturating_mul(60))
-        } else {
-            None
-        };
-
-        let quota = if quota_str.is_empty() || quota_str == "0" {
-            None
-        } else {
-            quota_str.parse::<u64>().ok()
-        };
-
-        Some((duration, quota))
     } else if Path::new("/usr/bin/zenity").exists() {
-        let out = Command::new("zenity")
+        let type_out = Command::new("zenity")
             .args([
-                "--forms",
+                "--list",
+                "--radiolist",
                 &format!("--title={title}"),
-                "--text=Configure session parameters",
-                "--add-entry=Duration in minutes (0=forever)",
-                "--add-entry=Command quota (empty for unlimited)",
-                "--separator=|",
+                "--text=Select limit type:",
+                "--column=",
+                "--column=Type",
+                "--column=ID",
+                "--hide-column=3",
+                "--print-column=3",
+                "TRUE",
+                "Duration (Minutes)",
+                "time",
+                "FALSE",
+                "Command Quota (Count)",
+                "quota",
             ])
             .output()
             .ok()?;
-        if !out.status.success() {
+        if !type_out.status.success() {
             return None;
         }
-        let res = String::from_utf8_lossy(&out.stdout).trim().to_string();
-        let mut parts = res.split('|');
-        let dur_str = parts.next().unwrap_or("").trim();
-        let quota_str = parts.next().unwrap_or("").trim();
+        let choice = String::from_utf8_lossy(&type_out.stdout).trim().to_string();
 
-        let duration = if dur_str.is_empty() || dur_str == "0" {
-            if is_arm { Some(0) } else { None }
-        } else if let Ok(mins) = dur_str.parse::<u64>() {
-            Some(mins.saturating_mul(60))
+        if choice == "quota" {
+            let prompt = if is_arm {
+                "Command quota limit (number of commands):"
+            } else {
+                "Additional command quota to add:"
+            };
+            let out = Command::new("zenity")
+                .args([
+                    "--entry",
+                    &format!("--title={title}"),
+                    &format!("--text={prompt}"),
+                    &format!("--entry-text={}", if is_arm { "10" } else { "5" }),
+                ])
+                .output()
+                .ok()?;
+            if !out.status.success() {
+                return None;
+            }
+            let quota_str = String::from_utf8_lossy(&out.stdout).trim().to_string();
+            let quota = quota_str.parse::<u64>().ok().filter(|&q| q > 0);
+            Some((None, quota))
         } else {
-            None
-        };
-
-        let quota = if quota_str.is_empty() || quota_str == "0" {
-            None
-        } else {
-            quota_str.parse::<u64>().ok()
-        };
-
-        Some((duration, quota))
+            let prompt = if is_arm {
+                "Duration in minutes (0 or empty for forever):"
+            } else {
+                "Additional minutes to add:"
+            };
+            let out = Command::new("zenity")
+                .args([
+                    "--entry",
+                    &format!("--title={title}"),
+                    &format!("--text={prompt}"),
+                    &format!("--entry-text={}", if is_arm { "15" } else { "10" }),
+                ])
+                .output()
+                .ok()?;
+            if !out.status.success() {
+                return None;
+            }
+            let dur_str = String::from_utf8_lossy(&out.stdout).trim().to_string();
+            let duration = if dur_str.is_empty() || dur_str == "0" {
+                if is_arm { Some(0) } else { None }
+            } else if let Ok(mins) = dur_str.parse::<u64>() {
+                Some(mins.saturating_mul(60))
+            } else {
+                None
+            };
+            Some((duration, None))
+        }
     } else {
         send_desktop_notification(
             title,
-            "Please use 'sudo agent-root-runner arm --duration <sec> --quota <n>' in terminal.",
+            "Please use 'sudo agent-root-runner arm' in terminal.",
             "normal",
         );
         None

@@ -19,7 +19,7 @@ use signal_hook::{
 };
 use state::StateMachine;
 use std::fs::{self, OpenOptions};
-use std::io::{self, BufRead, BufReader, Read, Write};
+use std::io::{self, BufRead, BufReader, IsTerminal, Read, Write};
 use std::os::fd::AsRawFd;
 use std::os::unix::fs::{FileTypeExt, MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::os::unix::net::{UnixListener, UnixStream};
@@ -132,17 +132,20 @@ enum Commands {
     #[command(about = "Start Model Context Protocol (MCP) server over stdio for AI agents")]
     Mcp,
     #[command(
-        about = "View recent audit log entries from the daemon (plain text or interactive TUI)"
+        about = "View recent audit log entries from the daemon (interactive TUI by default, or raw text)"
     )]
     Log {
         #[arg(
             long,
-            default_value_t = 20,
-            help = "Number of recent audit entries to display"
+            default_value_t = 50,
+            help = "Number of recent audit entries to fetch/display"
         )]
         limit: usize,
-        #[arg(long, help = "Open interactive terminal UI (TUI) log viewer")]
-        tui: bool,
+        #[arg(
+            long,
+            help = "Output raw plain text logs instead of launching interactive TUI"
+        )]
+        raw: bool,
     },
     #[command(about = "Run the desktop system tray indicator")]
     Tray,
@@ -194,8 +197,9 @@ fn run() -> Result<i32, String> {
             quota,
         } => {
             let mut p = Map::new();
-            p.insert("forever".into(), json!(forever));
-            if !forever {
+            let is_forever = forever || (quota.is_some() && duration.is_none());
+            p.insert("forever".into(), json!(is_forever));
+            if !is_forever {
                 p.insert("duration_seconds".into(), json!(duration.unwrap_or(900)));
             }
             if let Some(q) = quota {
@@ -225,7 +229,7 @@ fn run() -> Result<i32, String> {
         ),
         Commands::Exec(args) => exec_cli(cli.socket.as_deref(), args),
         Commands::Mcp => mcp(cli.socket.as_deref()),
-        Commands::Log { limit, tui } => log_cli(cli.socket.as_deref(), limit, tui),
+        Commands::Log { limit, raw } => log_cli(cli.socket.as_deref(), limit, raw),
         Commands::Tray => tray::run_tray(&resolve_socket(cli.socket.as_deref())),
     }
 }
@@ -308,9 +312,9 @@ fn status_cli(path: Option<&Path>, json_output: bool) -> Result<i32, String> {
     management(path, "status", Map::new())
 }
 
-fn log_cli(path: Option<&Path>, limit: usize, tui: bool) -> Result<i32, String> {
+fn log_cli(path: Option<&Path>, limit: usize, raw: bool) -> Result<i32, String> {
     let socket = resolve_socket(path);
-    if tui {
+    if !raw && std::io::stdout().is_terminal() {
         return tui::run_log_viewer(&socket, limit.max(100));
     }
     let mut params = Map::new();

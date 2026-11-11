@@ -104,9 +104,9 @@ sudo agent-root-runner arm --duration 600 --quota 20
 agent-root-runner status
 agent-root-runner status --json
 
-# View recent audit logs (plain text or interactive TUI, requires root)
-sudo agent-root-runner log --limit 20
-sudo agent-root-runner log --tui
+# View recent audit logs (interactive TUI by default, or raw text; requires root)
+sudo agent-root-runner log
+sudo agent-root-runner log --raw --limit 20
 
 # Extend active arm session time or quota
 sudo agent-root-runner extend --seconds 600 --quota 10
