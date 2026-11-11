@@ -60,11 +60,13 @@ daemon:    checks ARMED + quota + timeout, applies guardrails, runs as root
 ```bash
 cargo build --release
 sudo ./target/release/agent-root-runner install
+# Or also install shell completions for bash, zsh, and fish:
+sudo ./target/release/agent-root-runner install --completions
 ```
 
 `install` copies the binary to `/usr/local/bin`, writes
 `/etc/systemd/system/agent-root-runner.service`, enables it, and starts the
-daemon. It also adds a desktop autostart entry (`/etc/xdg/autostart/agent-root-runner-tray.desktop`) so the system tray indicator starts automatically with your graphical session. It also adds the first admin group it finds (`wheel`, then `sudo`, then
+daemon. It also adds a desktop autostart entry (`/etc/xdg/autostart/agent-root-runner-tray.desktop`) so the system tray indicator starts automatically with your graphical session. When `--completions` is passed, it writes shell completion scripts for bash, zsh, and fish to system completion directories. It also adds the first admin group it finds (`wheel`, then `sudo`, then
 `adm`) to the unit so that group can reach the socket. If none exists, the
 socket stays root-only.
 
@@ -77,9 +79,20 @@ Default paths:
 | Daemon unit | `/etc/systemd/system/agent-root-runner.service` |
 | Tray autostart | `/etc/xdg/autostart/agent-root-runner-tray.desktop` |
 | Binary | `/usr/local/bin/agent-root-runner` |
+| Bash completion | `/usr/share/bash-completion/completions/agent-root-runner` |
+| Zsh completion | `/usr/share/zsh/site-functions/_agent-root-runner` |
+| Fish completion | `/usr/share/fish/vendor_completions.d/agent-root-runner.fish` |
 
 Every command accepts `--socket <path>` to override the socket, which is handy
 for testing against a non-system daemon.
+
+Shell completions can also be output directly:
+
+```bash
+agent-root-runner completion bash
+agent-root-runner completion zsh
+agent-root-runner completion fish
+```
 
 ## Quick start
 

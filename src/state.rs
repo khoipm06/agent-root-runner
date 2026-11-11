@@ -1014,7 +1014,7 @@ mod tests {
         assert!(s["is_armed"].as_bool().unwrap());
         assert_eq!(s["quota_remaining"], 1);
         let a = m.admit(1, 0, 0, "test", "echo y").unwrap();
-        assert_eq!(a.remaining_seconds.unwrap_or_default() > 0., true);
+        assert!(a.remaining_seconds.unwrap_or_default() > 0.);
         m.disarm(0).unwrap();
         m.refund_quota().unwrap();
         assert_eq!(m.status().unwrap()["is_armed"], false);

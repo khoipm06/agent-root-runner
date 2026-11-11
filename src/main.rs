@@ -6,7 +6,11 @@ mod tray;
 mod tui;
 
 use audit::{AuditLogger, object};
-use clap::{Args, Parser, Subcommand};
+use clap::{Args, CommandFactory, Parser, Subcommand, ValueEnum};
+use clap_complete::{
+    generate,
+    shells::{Bash, Fish, Zsh},
+};
 use executor::Executor;
 use serde_json::{Map, Value, json};
 use signal_hook::{
@@ -60,12 +64,21 @@ struct Cli {
     #[command(subcommand)]
     command: Commands,
 }
+#[derive(Clone, Copy, ValueEnum)]
+enum ShellType {
+    Bash,
+    Zsh,
+    Fish,
+}
+
 #[derive(Subcommand)]
 enum Commands {
+    #[command(about = "Display daemon status, armed state, and remaining quota/timeout")]
     Status {
         #[arg(long, help = "Output status as JSON")]
         json: bool,
     },
+    #[command(about = "Arm the daemon for privileged command execution (requires root)")]
     Arm {
         #[arg(
             long,
@@ -82,19 +95,29 @@ enum Commands {
         #[arg(long, help = "Maximum admitted commands before automatic disarm")]
         quota: Option<u64>,
     },
-    #[command(about = "Extend an active arm session's duration or command quota")]
+    #[command(about = "Extend an active arm session's duration or command quota (requires root)")]
     Extend {
         #[arg(long, help = "Additional seconds to extend the active arm session")]
         seconds: Option<u64>,
         #[arg(long, help = "Additional command quota to extend")]
         quota: Option<u64>,
     },
+    #[command(about = "Disarm the daemon immediately and terminate in-flight commands")]
     Disarm,
-    Install,
+    #[command(about = "Install daemon systemd unit, binary, autostart tray, and shell completions")]
+    Install {
+        #[arg(
+            long,
+            help = "Also install shell completions for bash, zsh, and fish to system directories"
+        )]
+        completions: bool,
+    },
+    #[command(about = "Uninstall daemon systemd unit, autostart tray, binary, and optional logs")]
     Uninstall {
         #[arg(long, help = "Purge all audit logs under /var/log/agent-root-runner")]
         purge: bool,
     },
+    #[command(about = "Run the privileged daemon process")]
     Daemon {
         #[arg(long, help = "Append-only audit log path")]
         audit_log: Option<PathBuf>,
@@ -104,9 +127,13 @@ enum Commands {
         )]
         allow_user_arm: bool,
     },
+    #[command(about = "Execute a command as root while the daemon is armed")]
     Exec(ExecArgs),
+    #[command(about = "Start Model Context Protocol (MCP) server over stdio for AI agents")]
     Mcp,
-    #[command(about = "View recent audit log entries from the daemon")]
+    #[command(
+        about = "View recent audit log entries from the daemon (plain text or interactive TUI)"
+    )]
     Log {
         #[arg(
             long,
@@ -119,6 +146,11 @@ enum Commands {
     },
     #[command(about = "Run the desktop system tray indicator")]
     Tray,
+    #[command(about = "Generate shell completion script for bash, zsh, or fish")]
+    Completion {
+        #[arg(value_enum, help = "Shell to generate completions for")]
+        shell: ShellType,
+    },
 }
 #[derive(Args)]
 struct ExecArgs {
@@ -177,8 +209,12 @@ fn run() -> Result<i32, String> {
         }
         Commands::Disarm => management(cli.socket.as_deref(), "disarm", Map::new()),
         Commands::Extend { seconds, quota } => extend_cli(cli.socket.as_deref(), seconds, quota),
-        Commands::Install => install(),
+        Commands::Install { completions } => install(completions),
         Commands::Uninstall { purge } => uninstall(purge),
+        Commands::Completion { shell } => {
+            print_completions(shell);
+            Ok(0)
+        }
         Commands::Daemon {
             audit_log,
             allow_user_arm,
@@ -1801,6 +1837,9 @@ const BIN_PATH: &str = "/usr/local/bin/agent-root-runner";
 const MANIFEST_PATH: &str = "/etc/agent-root-runner/installed-files";
 const AUTOSTART_PATH: &str = "/etc/xdg/autostart/agent-root-runner-tray.desktop";
 const AUDIT_LOG_DIR: &str = "/var/log/agent-root-runner";
+const BASH_COMPLETION_PATH: &str = "/usr/share/bash-completion/completions/agent-root-runner";
+const ZSH_COMPLETION_PATH: &str = "/usr/share/zsh/site-functions/_agent-root-runner";
+const FISH_COMPLETION_PATH: &str = "/usr/share/fish/vendor_completions.d/agent-root-runner.fish";
 
 const AUTOSTART_DESKTOP: &str = r#"[Desktop Entry]
 Type=Application
@@ -1812,15 +1851,53 @@ Terminal=false
 Categories=Utility;
 "#;
 
-fn install() -> Result<i32, String> {
+fn print_completions(shell: ShellType) {
+    let mut cmd = Cli::command();
+    let name = "agent-root-runner";
+    match shell {
+        ShellType::Bash => generate(Bash, &mut cmd, name, &mut io::stdout()),
+        ShellType::Zsh => generate(Zsh, &mut cmd, name, &mut io::stdout()),
+        ShellType::Fish => generate(Fish, &mut cmd, name, &mut io::stdout()),
+    }
+}
+
+fn install_shell_completions() -> Result<(), String> {
+    let name = "agent-root-runner";
+    let targets = [
+        (BASH_COMPLETION_PATH, {
+            let mut buf = Vec::new();
+            generate(Bash, &mut Cli::command(), name, &mut buf);
+            buf
+        }),
+        (ZSH_COMPLETION_PATH, {
+            let mut buf = Vec::new();
+            generate(Zsh, &mut Cli::command(), name, &mut buf);
+            buf
+        }),
+        (FISH_COMPLETION_PATH, {
+            let mut buf = Vec::new();
+            generate(Fish, &mut Cli::command(), name, &mut buf);
+            buf
+        }),
+    ];
+
+    for (path_str, content) in targets {
+        let p = Path::new(path_str);
+        if let Some(parent) = p.parent() {
+            fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+        }
+        write_secure(p, &content, 0o644)?;
+        println!("Installed shell completion: {path_str}");
+    }
+    Ok(())
+}
+
+fn install(completions: bool) -> Result<i32, String> {
     if unsafe { libc::geteuid() } != 0 {
         return Err("install requires root. Run with sudo.".into());
     }
     let source = std::env::current_exe().map_err(|e| e.to_string())?;
     let dest = Path::new(BIN_PATH);
-    // Write the unit and the manifest before copying the binary: a partial
-    // failure can never leave an untracked binary behind, and `uninstall`
-    // can always recover from the manifest.
     let unit = Path::new(UNIT_PATH);
     if let Some(parent) = unit.parent() {
         fs::create_dir_all(parent).map_err(|e| e.to_string())?
@@ -1875,6 +1952,26 @@ fn install() -> Result<i32, String> {
     } else {
         println!("Reinstalled in place: {BIN_PATH}");
     }
+
+    if let Some(home) = invoking_user_home() {
+        let user_bin = home.join(".local/bin/agent-root-runner");
+        if user_bin.exists() {
+            if let Err(e) = fs::copy(dest, &user_bin) {
+                eprintln!(
+                    "Warning: could not update shadowing {}: {e}",
+                    user_bin.display()
+                );
+            } else {
+                let _ = fs::set_permissions(&user_bin, fs::Permissions::from_mode(0o755));
+                println!("Updated shadowing user binary: {}", user_bin.display());
+            }
+        }
+    }
+
+    if completions {
+        install_shell_completions()?;
+    }
+
     let _ = systemctl(&["daemon-reload"]);
     let _ = systemctl(&["enable", "agent-root-runner.service"]);
     if systemctl(&["restart", "agent-root-runner.service"]) != 0 {
@@ -1933,7 +2030,14 @@ fn uninstall(purge: bool) -> Result<i32, String> {
     let _ = systemctl(&["stop", "agent-root-runner.service"]);
     let _ = systemctl(&["disable", "agent-root-runner.service"]);
 
-    for path in [UNIT_PATH, BIN_PATH, AUTOSTART_PATH] {
+    for path in [
+        UNIT_PATH,
+        BIN_PATH,
+        AUTOSTART_PATH,
+        BASH_COMPLETION_PATH,
+        ZSH_COMPLETION_PATH,
+        FISH_COMPLETION_PATH,
+    ] {
         match fs::remove_file(path) {
             Ok(()) => println!("Removed: {path}"),
             Err(e) if e.kind() == io::ErrorKind::NotFound => (),

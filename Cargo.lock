@@ -8,6 +8,7 @@ version = "1.2.1"
 dependencies = [
  "chrono",
  "clap",
+ "clap_complete",
  "crossterm",
  "ksni",
  "libc",
@@ -334,6 +335,15 @@ dependencies = [
  "anstyle",
  "clap_lex",
  "strsim",
+]
+
+[[package]]
+name = "clap_complete"
+version = "4.6.11"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "037e2a1a92236d0aff7e845093f64661d6df4c02c9fcc61a60e9e1d736fa392f"
+dependencies = [
+ "clap",
 ]
 
 [[package]]
